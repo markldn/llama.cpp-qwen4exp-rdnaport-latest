@@ -949,6 +949,9 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
     // skip FLASH_ATTN_EXT since the sinks tensor is too small to choose a based based on it
     allow = allow && tensor->op != GGML_OP_FLASH_ATTN_EXT;
 
+    // skip FLASH_ATTN_QSA since the idx/mask tensors are too small to choose a backend based on them
+    allow = allow && tensor->op != GGML_OP_FLASH_ATTN_QSA;
+
     if (allow) {
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             const struct ggml_tensor * src = tensor->src[i];
@@ -2050,6 +2053,24 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
 }
 
 // utils
+
+// [TAG_ALLOC_SIZE_EXPAND]
+// returns true for ops that may require additional memory for fleeting data on some backends,
+// i.e. the backend's get_alloc_size may return more than ggml_nbytes for the output tensor
+bool ggml_backend_op_alloc_size_may_expand(enum ggml_op op) {
+    switch (op) {
+        case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_QSA:
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_CUMSUM:
+        case GGML_OP_ARGSORT:
+        case GGML_OP_TOP_K:
+            return true;
+        default:
+            return false;
+    }
+}
 
 enum ggml_status ggml_backend_view_init(struct ggml_tensor * tensor) {
     GGML_ASSERT(tensor);

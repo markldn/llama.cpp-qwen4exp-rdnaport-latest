@@ -1098,6 +1098,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "FLASH_ATTN_QSA",
 
     "UNARY",
 
@@ -1118,7 +1119,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "MOE_EXPERT_COPY",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1216,6 +1217,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "flash_attn_qsa(q, k, v, idx, mask)",
 
     "unary(x)",
 
@@ -1236,7 +1238,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "moe_expert_copy(pool)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5615,6 +5617,69 @@ void ggml_flash_attn_ext_add_sinks(
     GGML_ASSERT(sinks->type == GGML_TYPE_F32);
 
     a->src[4] = sinks;
+}
+
+// ggml_flash_attn_qsa: qwen4exp sparse attention over the indexer-selected cells.
+// Attends only over the n_top_k cells that the QSA indexer picked (idx),
+// instead of the whole KV cache.  The mask is the base kq_mask and is
+// gathered in-kernel at the idx positions.
+struct ggml_tensor * ggml_flash_attn_qsa(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * idx,
+        struct ggml_tensor  * mask,
+        float                 scale,
+        float                 logit_softcap) {
+    GGML_ASSERT(ggml_can_mul_mat(k, q));
+
+    GGML_ASSERT(q->ne[3] == k->ne[3]);
+    GGML_ASSERT(q->ne[3] == v->ne[3]);
+
+    GGML_ASSERT(idx->type == GGML_TYPE_I32);
+    GGML_ASSERT(idx->ne[1] == q->ne[1]);   // n_tps
+    GGML_ASSERT(idx->ne[3] == q->ne[3]);   // n_stream
+
+    GGML_ASSERT(mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(ggml_is_contiguous(mask));
+    GGML_ASSERT(mask->ne[0] == k->ne[1]);  // n_kv
+    GGML_ASSERT(mask->ne[1] == q->ne[1]);
+    GGML_ASSERT(mask->ne[3] == q->ne[3]);
+
+    // permute(0, 2, 1, 3)
+    int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    float params[] = { scale, logit_softcap };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_FLASH_ATTN_QSA;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = idx;
+    result->src[4] = mask;
+
+    return result;
+}
+
+void ggml_flash_attn_qsa_set_prec(
+        struct ggml_tensor * a,
+        enum ggml_prec       prec) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_QSA);
+
+    int32_t prec_i32 = (int32_t) prec;
+    ggml_set_op_params_i32(a, 2, prec_i32);
+}
+
+enum ggml_prec ggml_flash_attn_qsa_get_prec(
+        const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_QSA);
+
+    const int32_t prec_i32 = ggml_get_op_params_i32(a, 2);
+
+    return (enum ggml_prec) prec_i32;
 }
 
 // ggml_flash_attn_back
