@@ -404,7 +404,8 @@ llama_context::llama_context(
             moe_cache = std::make_unique<llama_moe_expert_cache>(model.devices[0].dev, cparams.moe_expert_cache_size);
 
             const int32_t n_expert_used_max = (int32_t) hparams.n_expert_used;
-            int32_t n_registered = 0;
+            int32_t n_candidates = 0; // CPU-resident MoE weight tensors found (this model has any at all)
+            int32_t n_registered = 0; // of those, how many the cache actually accepted
             for (uint32_t il = 0; il < hparams.n_layer(); il++) {
                 const auto & layer = model.layers[il];
                 ggml_tensor * cand[] = { layer.ffn_gate_up_exps, layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps };
@@ -417,20 +418,29 @@ llama_context::llama_context(
                     if (!ggml_backend_buffer_is_host(w->buffer)) {
                         continue;
                     }
+                    n_candidates++;
                     if (moe_cache->register_weight(w, n_expert_used_max)) {
                         n_registered++;
                     }
                 }
             }
-            if (n_registered == 0) {
+            if (n_registered > 0) {
+                // LLAMA_LOG_INFO is invisible at this component's default verbosity (unlike "srv"/"cmn"),
+                // so this uses WARN purely for visibility parity with the failure message below.
+                LLAMA_LOG_WARN("%s: MoE expert cache active: %d weight tensor(s), %d experts resident each\n",
+                                __func__, n_registered, cparams.moe_expert_cache_size);
+            } else if (n_candidates > 0) {
+                // real failure: there were CPU-offloaded MoE tensors to cache but every one was refused
+                // (e.g. the backend doesn't support mapped host memory, or pinning failed)
                 LLAMA_LOG_WARN("%s: --moe-expert-cache-experts=%d set but no CPU-offloaded MoE weight "
                                 "tensors were registered (pair with --n-cpu-moe N, and the backend must "
                                 "support mapped host memory); disabling the cache\n",
                                 __func__, cparams.moe_expert_cache_size);
                 moe_cache.reset();
             } else {
-                LLAMA_LOG_INFO("%s: MoE expert cache active: %d weight tensor(s), %d experts resident each\n",
-                                __func__, n_registered, cparams.moe_expert_cache_size);
+                // nothing to cache in this model at all (e.g. a speculative-decoding draft head with no
+                // --n-cpu-moe offload of its own) -- not an error, so don't warn about it
+                moe_cache.reset();
             }
         }
     }
