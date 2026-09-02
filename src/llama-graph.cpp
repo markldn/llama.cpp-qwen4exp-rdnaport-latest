@@ -15,9 +15,11 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
+#include "llama-moe-expert-cache.h"
 
 #include <cassert>
 #include <cmath>
+#include <tuple>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -1486,6 +1488,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    moe_cache        (params.moe_cache),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1544,7 +1547,30 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    // Device-side GPU-resident MoE expert cache (--moe-expert-cache-experts):
+    // if `w` was registered (a CPU-offloaded --n-cpu-moe weight tensor), page it
+    // through the persistent GPU pool instead of computing on the CPU. Scoped to
+    // just the main matmul below -- w_s (per-expert scale) and the LoRA branch
+    // further down are indexed by the ORIGINAL expert ids / w, so they
+    // deliberately keep using the un-substituted `ids`/`w`.
+    // See llama-moe-expert-cache.h and ~/.claude/plans/indexed-zooming-dream.md.
+    ggml_tensor * mm_w   = w;
+    ggml_tensor * mm_ids = ids;
+    // A single call can need at most cache_size distinct experts resident at once
+    // (ggml_moe_lru_ensure's eviction has nowhere to put more), so the cache only
+    // ever applies to small (~decode-sized) calls: warmup forces n_expert_used to
+    // ALL experts for this call (llm_graph_context ctor) to size buffers for the
+    // worst case, and graph_reserve/real prefill route many tokens through one
+    // call, both routinely exceeding cache_size. Neither needs the cache anyway --
+    // warmup only needs every code path touched once, and prefill already has a
+    // working fast path via ggml-backend.cpp's existing copy_experts offload
+    // (see ~/.claude/plans/indexed-zooming-dream.md); this cache targets exactly
+    // the case that mechanism doesn't reach: single/few-token decode.
+    if (moe_cache && moe_cache->has(w) && ggml_nelements(ids) <= moe_cache->cache_size()) {
+        std::tie(mm_w, mm_ids) = moe_cache->apply(ctx0, w, ids);
+    }
+
+    ggml_tensor * res = ggml_mul_mat_id(ctx0, mm_w, cur, mm_ids);
 
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];

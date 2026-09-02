@@ -288,6 +288,10 @@ private:
 
     llama_memory_ptr memory;
 
+    // nullptr unless --moe-expert-cache-experts is set and the backend supports it
+    // (mapped host memory) -- see llama-moe-expert-cache.h
+    std::unique_ptr<llama_moe_expert_cache> moe_cache;
+
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
 

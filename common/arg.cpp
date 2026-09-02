@@ -2798,6 +2798,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_DENSE_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_FFN"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-experts"}, "N",
+        "device-side GPU-resident LRU cache for MoE expert weights: keep N experts "
+        "resident per --n-cpu-moe-offloaded weight tensor instead of computing those "
+        "layers on the CPU every decode step (0 = disabled, default). CUDA/HIP only; "
+        "requires --n-cpu-moe > 0 to have anything to cache. See "
+        "~/.claude/plans/indexed-zooming-dream.md for the design.",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_expert_cache_size = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_EXPERTS"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

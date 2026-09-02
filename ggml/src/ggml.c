@@ -1098,9 +1098,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "MOE_LRU_ENSURE",
+    "MOE_EXPERT_COPY",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1213,9 +1216,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "moe_lru_ensure(ids)",
+    "moe_expert_copy(pool)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2134,6 +2140,80 @@ struct ggml_tensor * ggml_add_id(
     result->src[0] = a;
     result->src[1] = b;
     result->src[2] = ids;
+
+    return result;
+}
+
+// ggml_moe_lru_ensure
+
+struct ggml_tensor * ggml_moe_lru_ensure(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * slot_of_id,
+        struct ggml_tensor  * id_of_slot,
+        struct ggml_tensor  * usage,
+        struct ggml_tensor  * step,
+        struct ggml_tensor  * src_indices,
+        struct ggml_tensor  * dst_indices,
+        struct ggml_tensor  * num_copy,
+        int32_t               cache_size) {
+
+    GGML_ASSERT(ids->type        == GGML_TYPE_I32);
+    GGML_ASSERT(slot_of_id->type  == GGML_TYPE_I32);
+    GGML_ASSERT(id_of_slot->type  == GGML_TYPE_I32);
+    GGML_ASSERT(usage->type       == GGML_TYPE_I64);
+    GGML_ASSERT(step->type        == GGML_TYPE_I64);
+    GGML_ASSERT(src_indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst_indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(num_copy->type    == GGML_TYPE_I64);
+    GGML_ASSERT(id_of_slot->ne[0] == cache_size);
+    GGML_ASSERT(usage->ne[0]      == cache_size);
+    GGML_ASSERT(ggml_nelements(src_indices) >= ggml_nelements(ids));
+    GGML_ASSERT(ggml_nelements(dst_indices) >= ggml_nelements(ids));
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, ids);
+
+    ggml_set_op_params_i32(result, 0, cache_size);
+
+    result->op     = GGML_OP_MOE_LRU_ENSURE;
+    result->src[0] = ids;
+    result->src[1] = slot_of_id;
+    result->src[2] = id_of_slot;
+    result->src[3] = usage;
+    result->src[4] = step;
+    result->src[5] = src_indices;
+    result->src[6] = dst_indices;
+    result->src[7] = num_copy;
+
+    return result;
+}
+
+// ggml_moe_expert_copy
+
+struct ggml_tensor * ggml_moe_expert_copy(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * src_indices,
+        struct ggml_tensor  * dst_indices,
+        struct ggml_tensor  * num_copy,
+        struct ggml_tensor  * host_src,
+        struct ggml_tensor  * pool) {
+
+    GGML_ASSERT(src_indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst_indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(num_copy->type    == GGML_TYPE_I64);
+    GGML_ASSERT(host_src->type    == pool->type);
+    GGML_ASSERT(host_src->ne[0]   == pool->ne[0]);
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, pool);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) ggml_nelements(src_indices));
+
+    result->op     = GGML_OP_MOE_EXPERT_COPY;
+    result->src[0] = src_indices;
+    result->src[1] = dst_indices;
+    result->src[2] = num_copy;
+    result->src[3] = host_src;
+    result->src[4] = pool;
 
     return result;
 }

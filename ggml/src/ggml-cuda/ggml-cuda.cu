@@ -29,6 +29,7 @@
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
+#include "ggml-cuda/moe-lru.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -2251,6 +2252,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
+            break;
+        case GGML_OP_MOE_LRU_ENSURE:
+            ggml_cuda_op_moe_lru_ensure(ctx, dst);
+            break;
+        case GGML_OP_MOE_EXPERT_COPY:
+            ggml_cuda_op_moe_expert_copy(ctx, dst);
             break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
@@ -4673,6 +4680,42 @@ void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
     }
 }
 
+// Unconditional (no GGML_CUDA_REGISTER_HOST gate -- this is a different, opt-in-by-caller
+// mechanism, not the general mmap-staging path above): pins `buffer` and makes it
+// GPU-dereferenceable (cudaHostRegisterMapped), for the device-side MoE expert-cache
+// gather-copy kernel (ggml/src/ggml-cuda/moe-lru.cu) to read model weights straight
+// out of host RAM instead of a second copy. See ~/.claude/plans/indexed-zooming-dream.md.
+// *device_ptr receives the pointer the GPU should dereference (usually == buffer under
+// UVA -- confirmed on this project's gfx1201/ROCm 7.2 target -- but resolved via
+// cudaHostGetDevicePointer rather than assumed, for portability).
+bool ggml_backend_cuda_host_register_mapped(void * buffer, size_t size, void ** device_ptr) {
+    cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterMapped);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_WARN("%s: failed to register+map %.2f MiB of host memory: %s\n", __func__,
+                       size / 1024.0 / 1024.0, cudaGetErrorString(err));
+        return false;
+    }
+
+    err = cudaHostGetDevicePointer(device_ptr, buffer, 0);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_WARN("%s: registered but failed to resolve a device pointer: %s\n", __func__,
+                       cudaGetErrorString(err));
+        cudaHostUnregister(buffer);
+        return false;
+    }
+
+    return true;
+}
+
+void ggml_backend_cuda_host_unregister_mapped(void * buffer) {
+    cudaError_t err = cudaHostUnregister(buffer);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+    }
+}
+
 
 // backend device
 
@@ -4682,6 +4725,11 @@ struct ggml_backend_cuda_device_context {
     std::string description;
     std::string pci_bus_id;
     int op_offload_min_batch_size;
+    // separate, lower threshold for GGML_OP_MUL_MAT_ID: lets CPU-resident MoE expert
+    // weights be offloaded (and copy_experts's used-experts-only copy fire) even at
+    // decode batch size, instead of only during prompt processing. See
+    // ~/.claude/plans/indexed-zooming-dream.md.
+    int op_offload_min_batch_size_mul_mat_id;
 };
 
 static const char * ggml_backend_cuda_device_get_name(ggml_backend_dev_t dev) {
@@ -5193,6 +5241,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_COS:
         case GGML_OP_CLAMP:
         case GGML_OP_LOG:
+        case GGML_OP_MOE_LRU_ENSURE:
+        case GGML_OP_MOE_EXPERT_COPY:
             return true;
         case GGML_OP_ADD:
         case GGML_OP_SUB:
@@ -5341,7 +5391,11 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
 static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
-    return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
+    const int min_batch = op->op == GGML_OP_MUL_MAT_ID
+        ? dev_ctx->op_offload_min_batch_size_mul_mat_id
+        : dev_ctx->op_offload_min_batch_size;
+
+    return get_op_batch_size(op) >= min_batch;
 }
 
 static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_t dev) {
@@ -5489,6 +5543,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
     }
+    if (strcmp(name, "ggml_backend_cuda_host_register_mapped") == 0) {
+        return (void *)ggml_backend_cuda_host_register_mapped;
+    }
+    if (strcmp(name, "ggml_backend_cuda_host_unregister_mapped") == 0) {
+        return (void *)ggml_backend_cuda_host_unregister_mapped;
+    }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
     }
@@ -5513,6 +5573,7 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
         if (!initialized) {
             ggml_backend_cuda_reg_context * ctx = new ggml_backend_cuda_reg_context;
             const int min_batch_size = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
+            const int min_batch_size_mul_mat_id = getenv("GGML_OP_OFFLOAD_MIN_BATCH_MUL_MAT_ID") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH_MUL_MAT_ID")) : min_batch_size;
 
             const ggml_cuda_device_info & info = ggml_cuda_info();
             const bool virtual_devices = info.device_count > info.physical_device_count;
@@ -5536,6 +5597,7 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
                     c = std::tolower(c);
                 }
                 dev_ctx->op_offload_min_batch_size = min_batch_size;
+                dev_ctx->op_offload_min_batch_size_mul_mat_id = min_batch_size_mul_mat_id;
 
                 ggml_backend_dev_t dev = new ggml_backend_device {
                     /* .iface   = */ ggml_backend_cuda_device_interface,

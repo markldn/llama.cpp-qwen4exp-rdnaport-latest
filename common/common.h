@@ -582,6 +582,11 @@ struct common_params {
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
 
+    // 0 = disabled (default). >0 = device-side GPU-resident LRU cache for MoE
+    // expert weights (CUDA/HIP only); see src/llama-moe-expert-cache.h and
+    // ~/.claude/plans/indexed-zooming-dream.md.
+    int32_t moe_expert_cache_size = 0;
+
     bool single_turn       = false; // single turn chat conversation
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K

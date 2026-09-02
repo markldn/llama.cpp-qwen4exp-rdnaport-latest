@@ -40,6 +40,17 @@ GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * f
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
+// Pins `buffer` and resolves a GPU-dereferenceable pointer for it into *device_ptr
+// (cudaHostRegisterMapped -- distinct from the read-only staging registration above).
+// Looked up dynamically via ggml_backend_reg_get_proc_address by generic (non-CUDA)
+// code, same pattern as ggml_backend_set_n_threads; see
+// ggml_backend_cuda_host_register_mapped_t below for the matching function pointer type.
+GGML_BACKEND_API bool ggml_backend_cuda_host_register_mapped(void * buffer, size_t size, void ** device_ptr);
+GGML_BACKEND_API void ggml_backend_cuda_host_unregister_mapped(void * buffer);
+
+typedef bool (*ggml_backend_cuda_host_register_mapped_t)(void * buffer, size_t size, void ** device_ptr);
+typedef void (*ggml_backend_cuda_host_unregister_mapped_t)(void * buffer);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 
 #ifdef  __cplusplus

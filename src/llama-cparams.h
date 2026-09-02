@@ -54,6 +54,11 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    // 0 = disabled (default: --n-cpu-moe's static CPU/GPU split, unchanged).
+    // >0 = number of experts kept resident in the device-side LRU cache pool
+    // per cached MoE weight tensor; see llama-moe-expert-cache.h.
+    int32_t moe_expert_cache_size;
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;

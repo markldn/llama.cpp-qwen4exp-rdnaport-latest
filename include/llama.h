@@ -389,6 +389,11 @@ extern "C" {
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
+        // 0 = disabled (default). >0 = device-side GPU-resident LRU cache for MoE
+        // expert weights, paging this many experts per cached weight tensor instead
+        // of --n-cpu-moe's static whole-layer CPU/GPU split. CUDA/HIP only.
+        int32_t moe_expert_cache_size;
+
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
         // currently works only with CPU execution

@@ -590,6 +590,14 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        // Device-side GPU-resident LRU cache for MoE expert weights (paging
+        // individual experts into a small persistent GPU pool instead of a
+        // static whole-layer CPU/GPU split). See
+        // ~/.claude/plans/indexed-zooming-dream.md. Both ops keep all
+        // bookkeeping on the GPU with no host synchronization per call.
+        GGML_OP_MOE_LRU_ENSURE,
+        GGML_OP_MOE_EXPERT_COPY,
+
         GGML_OP_COUNT,
     };
 
@@ -918,6 +926,48 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // Device-side GPU-resident LRU expert cache (see GGML_OP_MOE_LRU_ENSURE above).
+    //
+    // ggml_moe_lru_ensure: given raw routed expert `ids` (I32, [n_expert_used,
+    // n_tokens, ...]), rewrites them to cache slot ids (returned as the result
+    // tensor, same shape as `ids`) and updates the persistent LRU bookkeeping
+    // in place: `slot_of_id` ([num_experts], I32, -1 = not resident),
+    // `id_of_slot` ([cache_size], I32), `usage` ([cache_size], I64, per-slot
+    // last-touched step), `step` ([1], I64, incremented once per call).
+    // `src_indices`/`dst_indices` ([n_expert_used*n_tokens], I32) and
+    // `num_copy` ([1], I64) are written with the (source expert row, dest
+    // slot) copy plan for this call's misses, consumed by ggml_moe_expert_copy.
+    // All of slot_of_id/id_of_slot/usage/step/src_indices/dst_indices/num_copy
+    // must be persistent tensors (stable data pointer across calls, e.g.
+    // allocated via ggml_backend_alloc_ctx_tensors_from_buft, not gallocr) —
+    // this op reads AND mutates their existing contents every call.
+    GGML_API struct ggml_tensor * ggml_moe_lru_ensure(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * slot_of_id,
+            struct ggml_tensor  * id_of_slot,
+            struct ggml_tensor  * usage,
+            struct ggml_tensor  * step,
+            struct ggml_tensor  * src_indices,
+            struct ggml_tensor  * dst_indices,
+            struct ggml_tensor  * num_copy,
+            int32_t               cache_size);
+
+    // ggml_moe_expert_copy: copies the rows named by `src_indices`/`dst_indices`
+    // (only the first `num_copy` of them, read on-device — see
+    // ggml_moe_lru_ensure) from `host_src` ([num_experts, row_elems], any
+    // dereferenceable-from-device pointer, e.g. mapped pinned host memory) into
+    // `pool` ([cache_size, row_elems], persistent GPU tensor) in place. Returns
+    // a view of `pool` (result->data == pool->data) so downstream ops (e.g.
+    // ggml_mul_mat_id) can depend on this op while reading `pool` directly.
+    GGML_API struct ggml_tensor * ggml_moe_expert_copy(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * src_indices,
+            struct ggml_tensor  * dst_indices,
+            struct ggml_tensor  * num_copy,
+            struct ggml_tensor  * host_src,
+            struct ggml_tensor  * pool);
 
     GGML_DEPRECATED(GGML_API struct ggml_tensor * ggml_add1(
             struct ggml_context * ctx,

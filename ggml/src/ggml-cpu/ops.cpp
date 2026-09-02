@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstring>
+#include <vector>
 
 // ggml_compute_forward_dup
 
@@ -767,6 +769,151 @@ void ggml_compute_forward_add_id(
             {
                 GGML_ABORT("unsupported type for ggml_compute_forward_add_id: %s", ggml_type_name(src0->type));
             }
+    }
+}
+
+// ggml_compute_forward_moe_lru_ensure
+//
+// Reference (correctness, not perf) implementation of the device-side LRU cache
+// algorithm ported from FreeToken's GPU kernels: single-threaded, sequential over
+// the (small, n_expert_used * n_tokens) query ids. See ggml_moe_lru_ensure in ggml.h.
+
+void ggml_compute_forward_moe_lru_ensure(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    // Bookkeeping is a small sequential state machine (dedup + LRU eviction
+    // over a tiny id set) — not worth splitting across threads; only thread 0 runs.
+    if (params->ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * ids         = dst->src[0];
+    const ggml_tensor * t_slot_of_id = dst->src[1];
+    const ggml_tensor * t_id_of_slot = dst->src[2];
+    const ggml_tensor * t_usage      = dst->src[3];
+    const ggml_tensor * t_step       = dst->src[4];
+    const ggml_tensor * t_src_idx    = dst->src[5];
+    const ggml_tensor * t_dst_idx    = dst->src[6];
+    const ggml_tensor * t_num_copy   = dst->src[7];
+
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+
+    const int32_t cache_size = ggml_get_op_params_i32(dst, 0);
+    GGML_ASSERT(cache_size > 0);
+
+    const int32_t * ids_d  = (const int32_t *) ids->data;
+    int32_t * out_d        = (int32_t *) dst->data;
+    int32_t * slot_of_id   = (int32_t *) t_slot_of_id->data;
+    int32_t * id_of_slot   = (int32_t *) t_id_of_slot->data;
+    int64_t * usage        = (int64_t *) t_usage->data;
+    int64_t * step_d       = (int64_t *) t_step->data;
+    int32_t * src_idx      = (int32_t *) t_src_idx->data;
+    int32_t * dst_idx      = (int32_t *) t_dst_idx->data;
+    int64_t * num_copy_d   = (int64_t *) t_num_copy->data;
+
+    const int64_t n_ids = ggml_nelements(ids);
+    GGML_ASSERT(n_ids <= cache_size); // caller must size the cache >= n_expert_used * n_tokens per call
+
+    const int64_t cur_step = ++(*step_d);
+
+    std::vector<bool> claimed(cache_size, false);
+    int32_t n_missing = 0;
+
+    for (int64_t i = 0; i < n_ids; i++) {
+        const int32_t id = ids_d[i];
+        int32_t slot = slot_of_id[id];
+
+        if (slot >= 0) {
+            usage[slot] = cur_step;
+            claimed[slot] = true;
+            out_d[i] = slot;
+            continue;
+        }
+
+        // dedup against earlier positions in this same call
+        bool found = false;
+        for (int64_t j = 0; j < i; j++) {
+            if (ids_d[j] == id) {
+                out_d[i] = out_d[j];
+                found = true;
+                break;
+            }
+        }
+        if (found) {
+            continue;
+        }
+
+        // evict: argmin usage over slots not already claimed this call
+        int32_t victim = -1;
+        int64_t best = INT64_MAX;
+        for (int32_t s = 0; s < cache_size; s++) {
+            if (claimed[s]) {
+                continue;
+            }
+            if (usage[s] < best) {
+                best = usage[s];
+                victim = s;
+            }
+        }
+        GGML_ASSERT(victim >= 0);
+
+        const int32_t old_id = id_of_slot[victim];
+        if (old_id >= 0) {
+            slot_of_id[old_id] = -1;
+        }
+        id_of_slot[victim] = id;
+        slot_of_id[id] = victim;
+        usage[victim] = cur_step;
+        claimed[victim] = true;
+
+        src_idx[n_missing] = id;
+        dst_idx[n_missing] = victim;
+        n_missing++;
+
+        out_d[i] = victim;
+    }
+
+    *num_copy_d = n_missing;
+}
+
+// ggml_compute_forward_moe_expert_copy
+//
+// Reference (correctness, not perf) implementation: sequential row-by-row memcpy
+// from host_src into pool for the first num_copy entries of src_indices/dst_indices.
+// See ggml_moe_expert_copy in ggml.h.
+
+void ggml_compute_forward_moe_expert_copy(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    if (params->ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * t_src_idx  = dst->src[0];
+    const ggml_tensor * t_dst_idx  = dst->src[1];
+    const ggml_tensor * t_num_copy = dst->src[2];
+    const ggml_tensor * host_src   = dst->src[3];
+    const ggml_tensor * pool       = dst->src[4];
+
+    GGML_ASSERT(dst->data == pool->data); // ggml_moe_expert_copy's result is a view of pool
+
+    const int32_t * src_idx = (const int32_t *) t_src_idx->data;
+    const int32_t * dst_idx = (const int32_t *) t_dst_idx->data;
+    const int64_t n = *(const int64_t *) t_num_copy->data;
+
+    const size_t row_bytes = ggml_row_size(host_src->type, host_src->ne[0]);
+    GGML_ASSERT(row_bytes == ggml_row_size(pool->type, pool->ne[0]));
+
+    for (int64_t i = 0; i < n; i++) {
+        const int32_t sid = src_idx[i];
+        const int32_t did = dst_idx[i];
+        std::memcpy(
+            (char *) pool->data + (size_t) did * row_bytes,
+            (const char *) host_src->data + (size_t) sid * row_bytes,
+            row_bytes);
     }
 }
 

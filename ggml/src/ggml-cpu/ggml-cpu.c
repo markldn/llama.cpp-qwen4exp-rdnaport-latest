@@ -2032,6 +2032,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_glu(params, tensor);
             } break;
+        case GGML_OP_MOE_LRU_ENSURE:
+            {
+                ggml_compute_forward_moe_lru_ensure(params, tensor);
+            } break;
+        case GGML_OP_MOE_EXPERT_COPY:
+            {
+                ggml_compute_forward_moe_expert_copy(params, tensor);
+            } break;
         case GGML_OP_GET_REL_POS:
             {
                 ggml_compute_forward_get_rel_pos(params, tensor);
@@ -2318,6 +2326,12 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                     GGML_ABORT("fatal error");
             }
             break;
+        case GGML_OP_MOE_LRU_ENSURE:
+        case GGML_OP_MOE_EXPERT_COPY:
+            {
+                // small sequential bookkeeping / gather-copy; single-threaded reference impl
+                n_tasks = 1;
+            } break;
         case GGML_OP_SILU_BACK:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
