@@ -2803,8 +2803,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "device-side GPU-resident LRU cache for MoE expert weights: keep N experts "
         "resident per --n-cpu-moe-offloaded weight tensor instead of computing those "
         "layers on the CPU every decode step (0 = disabled, default). CUDA/HIP only; "
-        "requires --n-cpu-moe > 0 to have anything to cache. See "
-        "~/.claude/plans/indexed-zooming-dream.md for the design.",
+        "requires --n-cpu-moe > 0 to have anything to cache. See the README for the "
+        "design and measured results.",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
