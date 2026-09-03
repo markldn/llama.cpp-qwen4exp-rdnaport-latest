@@ -56,8 +56,12 @@ struct llama_cparams {
 
     // 0 = disabled (default: --n-cpu-moe's static CPU/GPU split, unchanged).
     // >0 = number of experts kept resident in the device-side LRU cache pool
-    // per cached MoE weight tensor; see llama-moe-expert-cache.h.
+    // per cached MoE layer; see llama-moe-expert-cache.h.
     int32_t moe_expert_cache_size;
+    // max expert uploads per cached layer per decode step (throttles the
+    // async cache-fill worker so a cold cache can't saturate the host<->GPU
+    // link); see llama-moe-expert-cache.h.
+    int32_t moe_expert_cache_inserts;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

@@ -1,87 +1,93 @@
 #pragma once
 
-// Device-side GPU-resident LRU cache for MoE expert weights: pages individual
-// experts into a small persistent GPU pool per call, fetched over PCIe from
-// the model's already-loaded (mmap'd) host weight tensor, instead of a static
-// whole-layer CPU/GPU split (--n-cpu-moe). All cache bookkeeping (hit/miss,
-// eviction, slot assignment) runs as GPU kernels with no host synchronization
-// per call -- see ggml_moe_lru_ensure/ggml_moe_expert_copy in ggml.h and
-// ~/.claude/plans/indexed-zooming-dream.md for the full design and the reason
-// this exists (a host-orchestrated first attempt regressed decode throughput).
-
-#include "ggml.h"
-#include "ggml-backend.h"
-#include "ggml-cpp.h"
+// GPU-resident LRU cache for MoE expert weights that live in host memory (via
+// -ot ...exps=CPU / --n-cpu-moe). Decode on a host-offloaded MoE layer is
+// bound by host RAM bandwidth: every token streams the routed experts'
+// weights from system RAM. This caches recently-used experts in VRAM.
+//
+// This is the second design (2026-09-03), replacing the original
+// synchronous-fetch-on-miss one: that version's ggml_moe_expert_copy ran
+// in-graph, so every decode step blocked on a PCIe copy for any miss
+// (rocprofv3 measured it at ~35% of total GPU kernel time -- more than the
+// actual MoE matmuls). This version never blocks decode on a miss:
+//
+//  - per cached layer, companion tensors up_c/gate_c/down_c of shape
+//    [ne0, ne1, n_slots+1] live in the device buffer of that layer's router
+//    (llama_moe_cache_init groups host-resident layers by the buffer TYPE of
+//    their ffn_gate_inp -- correct per-device placement in a multi-GPU split
+//    falls out of this for free, no explicit device-list plumbing needed);
+//    slot n_slots is permanently zero (the "dummy" slot).
+//  - an I32 table[n_expert] maps expert id -> slot, or n_slots when uncached.
+//    One copy on device (read by ggml_get_rows to remap ids for the
+//    cache-side mul_mat_id chain) and one on host (read by the CPU
+//    mul_mat_id via src[3] -- see ggml_compute_forward_mul_mat_id in
+//    ggml-cpu.c -- to SKIP cached ids there, zeroing their dst rows).
+//  - the two down-projection outputs are summed: uncached ids contribute 0
+//    through the cache chain (their remapped slot is the all-zero dummy
+//    slot) and cached ids contribute 0 through the CPU chain (skipped), so
+//    the result is exact either way -- each expert is computed on exactly
+//    one of the two chains.
+//  - a miss is never fetched inline. llama_moe_cache_step(), called once per
+//    llama_context::decode() after the graph has finished executing (a safe
+//    sync point -- no graph is running), evicts LRU victims and hands their
+//    replacement slice-copies to a background worker thread. The new
+//    mapping is only published (table updated) once the worker reports the
+//    copy done, at a LATER step() call -- a running graph can never observe
+//    a torn slot. Uploads are throttled (n_moe_cache_inserts per layer per
+//    step) so a cold cache can't saturate the host<->GPU link.
+//  - the CPU mul_mat_id path computing a miss THIS step is exactly the
+//    stock no-cache path (same cost as caching being off for that expert) --
+//    the cache only ever removes work, never adds a stall.
+//
+// Ported from the mechanism in ggml-org/llama.cpp#27861 (open PR, same core
+// design), adapted to this fork's qwen4exp/build_moe_ffn call shape and
+// kept single-threaded-simple where the original PR already was.
+//
+// Enabled via --moe-expert-cache-experts N (slots/layer) and
+// --moe-expert-cache-inserts N (uploads/layer/step, default 2).
 
 #include <cstdint>
-#include <unordered_map>
-#include <vector>
 
-// One persistent LRU pool + bookkeeping set per cached MoE weight tensor
-// (e.g. one per layer's ffn_gate_up_exps, one per layer's ffn_down_exps).
-struct llama_moe_expert_cache {
-    llama_moe_expert_cache(ggml_backend_dev_t dev, int32_t cache_size);
-    ~llama_moe_expert_cache();
+struct llama_model;
+struct ggml_tensor;
 
-    llama_moe_expert_cache(const llama_moe_expert_cache &) = delete;
-    llama_moe_expert_cache & operator=(const llama_moe_expert_cache &) = delete;
+struct llama_moe_cache_layer {
+    int il = -1;
 
-    // Registers a CPU-resident MoE weight tensor (already fully loaded --
-    // ->data valid and stable, e.g. mmap'd by --n-cpu-moe) for caching: pins +
-    // GPU-maps its host memory (no data copy or move -- the tensor's ->data
-    // pointer and buffer are untouched) and allocates a GPU pool + LRU
-    // bookkeeping sized for `cache_size` resident experts. `n_expert_used_max`
-    // bounds how many distinct experts a single call can need (n_expert_used,
-    // or that times n_tokens for a batched call) -- must be <= cache_size.
-    // Returns false (logs and leaves the tensor unregistered) if pinning
-    // fails or the backend doesn't support the mapped-host-memory API.
-    bool register_weight(const ggml_tensor * weight, int32_t n_expert_used_max);
+    int32_t n_slots = 0;
 
-    // Whether `weight` was successfully registered (i.e. the graph builder
-    // should route it through apply() instead of using it directly).
-    bool has(const ggml_tensor * weight) const;
+    // host-resident source weights (the authoritative experts)
+    ggml_tensor * up_src   = nullptr;
+    ggml_tensor * gate_src = nullptr;
+    ggml_tensor * down_src = nullptr;
 
-    // Builds the (fixed-topology) op nodes for one call in the per-graph-build
-    // context `ctx0`: returns {pool_weight_view, remapped_ids} to feed into
-    // ggml_mul_mat_id instead of {weight, ids}. `weight` must have been
-    // registered. `ids` is the router's selected-experts tensor (I32).
-    std::pair<ggml_tensor *, ggml_tensor *> apply(
-            ggml_context * ctx0, const ggml_tensor * weight, ggml_tensor * ids) const;
+    // device-resident cache slots, ne[2] == n_slots + 1 (last slot all zeros)
+    ggml_tensor * up_c   = nullptr;
+    ggml_tensor * gate_c = nullptr;
+    ggml_tensor * down_c = nullptr;
 
-    int32_t cache_size() const { return m_cache_size; }
-
-private:
-    struct layer_state {
-        ggml_tensor * pool       = nullptr; // [row_elems, cache_size], GPU
-        ggml_tensor * host_src   = nullptr; // [row_elems, num_experts], data = mapped pointer into weight's own memory
-        ggml_tensor * slot_of_id = nullptr; // [num_experts], GPU I32
-        ggml_tensor * id_of_slot = nullptr; // [cache_size], GPU I32
-        ggml_tensor * usage      = nullptr; // [cache_size], GPU I64
-        ggml_tensor * step       = nullptr; // [1], GPU I64
-        ggml_tensor * src_idx    = nullptr; // [n_expert_used_max], GPU I32 scratch
-        ggml_tensor * dst_idx    = nullptr; // [n_expert_used_max], GPU I32 scratch
-        ggml_tensor * num_copy   = nullptr; // [1], GPU I64 scratch
-
-        void * host_registered_ptr = nullptr; // weight->data, for unregistration on teardown
-
-        // one ggml_context/buffer pair per registered weight: simplest correct
-        // lifetime (own everything above, freed together), cache_size here is
-        // always small (tens of layers at most) so the extra buffer objects
-        // this costs vs. one shared batched allocation are not worth optimizing.
-        ggml_context_ptr        gpu_ctx;  // owns pool/slot_of_id/id_of_slot/usage/step/src_idx/dst_idx/num_copy
-        ggml_backend_buffer_ptr gpu_buf;  // backs gpu_ctx's tensors
-        ggml_context_ptr        host_ctx; // owns host_src (the tensor object only -- its data aliases host_registered_ptr)
-        // wraps host_registered_ptr under the GPU device's buffer TYPE (see .cpp)
-        // so the scheduler treats host_src as already resident on that device --
-        // no cross-backend copy gets inserted for it.
-        ggml_backend_buffer_ptr host_view_buf;
-    };
-
-    ggml_backend_dev_t m_dev;
-    int32_t m_cache_size;
-
-    void * m_host_register_mapped_fn   = nullptr; // ggml_backend_cuda_host_register_mapped_t
-    void * m_host_unregister_mapped_fn = nullptr; // ggml_backend_cuda_host_unregister_mapped_t
-
-    std::unordered_map<const ggml_tensor *, layer_state> m_layers;
+    // expert id -> slot (or n_slots when uncached); I32 [1, n_expert]
+    ggml_tensor * dev_table  = nullptr;
+    ggml_tensor * host_table = nullptr;
 };
+
+// Build the cache for every host-resident expert layer of the model. Safe to
+// call more than once (e.g. once per llama_context, target + MTP draft) --
+// only the first call that actually finds host-resident layers does work;
+// a model with none (like a fully GPU-resident draft head) is a no-op that
+// leaves the door open for a later real call to still succeed.
+void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t max_inserts);
+
+// nullptr when the cache is disabled or this tensor has no cached layer.
+const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * up_exps);
+
+// Apply throttled LRU updates (publish completed uploads, evict + schedule
+// new ones). Call once per decode(), between graph executions only -- never
+// while a graph referencing the cache tensors/tables may still be running.
+void llama_moe_cache_step();
+
+// Stops the upload worker thread and frees cache resources. Call once at
+// process/context teardown if a clean shutdown matters (tests, embedding
+// this in a longer-lived host process); the OS reclaims everything on exit
+// either way, so a normal llama-server run doesn't need to call this.
+void llama_moe_cache_shutdown();

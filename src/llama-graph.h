@@ -20,7 +20,6 @@ struct llama_cparams;
 struct llama_layer;
 
 struct llama_memory_context_i;
-struct llama_moe_expert_cache;
 
 class llama_kv_cache_context;
 class llama_kv_cache_dsa_context;
@@ -786,9 +785,6 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
-    // nullptr unless --moe-expert-cache-experts is set and the backend supports it;
-    // see llama-moe-expert-cache.h
-    llama_moe_expert_cache        * moe_cache;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1029,7 +1025,6 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
-    llama_moe_expert_cache        * moe_cache;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

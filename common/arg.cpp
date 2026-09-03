@@ -2801,9 +2801,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--moe-expert-cache-experts"}, "N",
         "device-side GPU-resident LRU cache for MoE expert weights: keep N experts "
-        "resident per --n-cpu-moe-offloaded weight tensor instead of computing those "
-        "layers on the CPU every decode step (0 = disabled, default). CUDA/HIP only; "
-        "requires --n-cpu-moe > 0 to have anything to cache. See the README for the "
+        "resident per --n-cpu-moe-offloaded layer instead of computing those layers "
+        "on the CPU every decode step (0 = disabled, default). Cache misses are "
+        "served asynchronously by a background worker -- a miss never blocks decode, "
+        "it just falls back to the normal CPU path for that expert this step. "
+        "Requires --n-cpu-moe > 0 to have anything to cache. See the README for the "
         "design and measured results.",
         [](common_params & params, int value) {
             if (value < 0) {
@@ -2812,6 +2814,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_expert_cache_size = value;
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_EXPERTS"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-inserts"}, "N",
+        string_format("max expert uploads per cached layer per decode step for the MoE "
+        "expert cache, throttled so a cold cache can't saturate the host<->GPU link "
+        "(default: %d)", params.moe_expert_cache_inserts),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_expert_cache_inserts = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_INSERTS"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

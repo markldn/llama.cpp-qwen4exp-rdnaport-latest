@@ -1488,7 +1488,6 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
-    moe_cache        (params.moe_cache),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1547,30 +1546,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
-    // Device-side GPU-resident MoE expert cache (--moe-expert-cache-experts):
-    // if `w` was registered (a CPU-offloaded --n-cpu-moe weight tensor), page it
-    // through the persistent GPU pool instead of computing on the CPU. Scoped to
-    // just the main matmul below -- w_s (per-expert scale) and the LoRA branch
-    // further down are indexed by the ORIGINAL expert ids / w, so they
-    // deliberately keep using the un-substituted `ids`/`w`.
-    // See llama-moe-expert-cache.h and ~/.claude/plans/indexed-zooming-dream.md.
-    ggml_tensor * mm_w   = w;
-    ggml_tensor * mm_ids = ids;
-    // A single call can need at most cache_size distinct experts resident at once
-    // (ggml_moe_lru_ensure's eviction has nowhere to put more), so the cache only
-    // ever applies to small (~decode-sized) calls: warmup forces n_expert_used to
-    // ALL experts for this call (llm_graph_context ctor) to size buffers for the
-    // worst case, and graph_reserve/real prefill route many tokens through one
-    // call, both routinely exceeding cache_size. Neither needs the cache anyway --
-    // warmup only needs every code path touched once, and prefill already has a
-    // working fast path via ggml-backend.cpp's existing copy_experts offload
-    // (see ~/.claude/plans/indexed-zooming-dream.md); this cache targets exactly
-    // the case that mechanism doesn't reach: single/few-token decode.
-    if (moe_cache && moe_cache->has(w) && ggml_nelements(ids) <= moe_cache->cache_size()) {
-        std::tie(mm_w, mm_ids) = moe_cache->apply(ctx0, w, ids);
-    }
-
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, mm_w, cur, mm_ids);
+    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
 
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];
@@ -2128,7 +2104,63 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+    // MoE expert cache (see llama-moe-expert-cache.h): during single-token decode
+    // on a layer whose experts live in host memory, run a parallel mul_mat_id
+    // chain over a device-resident cache of hot experts. Cached ids are skipped
+    // by the CPU chain (src[3] table, set below on up/gate/down) and served by
+    // the cache chain instead; uncached ids map to the cache's zero slot. The
+    // two chains' outputs are summed, exact either way.
+    // n_tokens<=4 covers decode (1) and small MTP speculative-verify batches
+    // (n-max+1 tokens in one call, e.g. 4 for n-max=3) -- matches the cap
+    // moe_obs_cb already uses to decide what's worth feeding the LRU (real
+    // prefill batches are excluded there too). No cache_size/batch-size
+    // relationship needed here (unlike the old synchronous design): misses
+    // simply run on the CPU chain like caching was off for them, whatever
+    // the batch size, so there's no capacity case where the cache "does
+    // nothing" for an oversized call.
+    //
+    // DO NOT raise this cap without first root-causing a real crash found
+    // 2026-09-03 testing n-max=4 (5-token verify batches): "ROCm error,
+    // current device: -1" inside ggml_backend_cuda_synchronize, called from
+    // the MAIN graph's own compute path (not the cache's worker thread) --
+    // see llama_moe_cache_init's per-device ggml_backend_t (moe_cache::
+    // backends / layer_state::backend in llama-moe-expert-cache.cpp). Likely
+    // cause: an independently-created ggml_backend_t for a device that
+    // already has one owned by the main llama_context isn't safe to use
+    // concurrently under ROCm even with backend_mtx serializing the actual
+    // tensor_set_async/synchronize calls -- something in the per-device
+    // HIP/driver state two separate backend *contexts* touch may not be as
+    // externally-lockable as assumed. n-max=3 (n_tokens<=4) is verified
+    // correct and stable; don't extend past it without investigating this.
+    const llama_moe_cache_layer * mcache = nullptr;
+    ggml_tensor * mc_slot_ids = nullptr;
+    if (n_tokens >= 1 && n_tokens <= 4 && !gate_up_exps && gate_exps && down_exps &&
+        !up_exps_b && !gate_exps_b && !down_exps_b &&
+        !up_exps_s && !gate_exps_s && !down_exps_s &&
+        type_op == LLM_FFN_SILU && !weight_before_ffn && loras->empty()) {
+        mcache = llama_moe_cache_lookup(up_exps);
+    }
+    if (mcache) {
+        // dev_table is one shared [1, n_expert] lookup, not per-token data,
+        // so ggml_get_rows' batched form (which requires a->ne[2] ==
+        // b->ne[1], no implicit broadcast of the batch dim) doesn't apply
+        // directly -- and CUDA/HIP's REPEAT op only supports F32/F16, not
+        // this I32 table, so replicating dev_table isn't an option either.
+        // Flatten the [n_expert_used, n_tokens] ids to one column instead:
+        // a single non-batched get_rows against the shared table, reshaped
+        // back after.
+        ggml_tensor * ids_flat = selected_experts;
+        if (n_tokens > 1) {
+            ids_flat = ggml_cont(ctx0, ids_flat); // argsort_top_k's output isn't guaranteed contiguous here
+        }
+        ids_flat = ggml_reshape_2d(ctx0, ids_flat, (int64_t) n_expert_used * n_tokens, 1);
+        mc_slot_ids = ggml_get_rows(ctx0, mcache->dev_table, ids_flat); // [1, n_expert_used*n_tokens, 1]
+        mc_slot_ids = ggml_reshape_2d(ctx0, mc_slot_ids, n_expert_used, n_tokens);
+        cb(mc_slot_ids, "ffn_moe_cache_slots", il);
+    }
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+    ggml_tensor * mc_inp = cur;
 
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
@@ -2164,6 +2196,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
+        if (mcache) {
+            up->src[3] = mcache->host_table;
+            up->op_params[0] = mcache->n_slots;
+        }
+
         if (up_exps_s) {
             cb(up, "ffn_moe_up_scaled", il);
         }
@@ -2176,6 +2213,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (gate_exps) {
             cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
+
+            if (mcache) {
+                cur->src[3] = mcache->host_table;
+                cur->op_params[0] = mcache->n_slots;
+            }
         } else {
             cur = up;
         }
@@ -2280,6 +2322,43 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
+
+    if (mcache) {
+        experts->src[3] = mcache->host_table;
+        experts->op_params[0] = mcache->n_slots;
+
+        // device-side chain over the cached experts, mirroring the LLM_FFN_SILU
+        // activation above (the only type_op the cache path is enabled for)
+        ggml_tensor * up_g   = ggml_mul_mat_id(ctx0, mcache->up_c,   mc_inp, mc_slot_ids);
+        ggml_tensor * gate_g = ggml_mul_mat_id(ctx0, mcache->gate_c, mc_inp, mc_slot_ids);
+        cb(up_g,   "ffn_moe_cache_up",   il);
+        cb(gate_g, "ffn_moe_cache_gate", il);
+
+        ggml_tensor * act_g = nullptr;
+        {
+            const float limit = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
+            constexpr float eps = 1e-6f;
+            if (limit > eps) {
+                up_g = ggml_clamp(ctx0, up_g, -limit, limit);
+                if (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
+                    gate_g = ggml_clamp(ctx0, gate_g, -INFINITY, limit);
+                    act_g  = ggml_swiglu_split(ctx0, gate_g, up_g);
+                } else {
+                    ggml_tensor * ga = ggml_silu(ctx0, gate_g);
+                    ga    = ggml_clamp(ctx0, ga, -INFINITY, limit);
+                    act_g = ggml_mul(ctx0, ga, up_g);
+                }
+            } else {
+                act_g = ggml_swiglu_split(ctx0, gate_g, up_g);
+            }
+        }
+
+        ggml_tensor * down_g = ggml_mul_mat_id(ctx0, mcache->down_c, act_g, mc_slot_ids);
+        cb(down_g, "ffn_moe_cache_down", il);
+
+        experts = ggml_add(ctx0, experts, down_g);
+        cb(experts, "ffn_moe_cache_merged", il);
+    }
 
     if (down_exps_s) {
         cb(experts, "ffn_moe_down_scaled", il);

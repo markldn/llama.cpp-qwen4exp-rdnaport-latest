@@ -1,232 +1,580 @@
 #include "llama-moe-expert-cache.h"
 
-#include "../ggml/src/ggml-backend-impl.h" // ggml_backend_buffer_i / ggml_backend_buffer_init: same private-header
-                                             // access pattern tests/test-alloc.cpp already uses for a custom buffer.
-#include "ggml-alloc.h"
+#include "llama-impl.h"
+#include "llama-model.h"
+
+#include "ggml.h"
+#include "ggml-backend.h"
 #include "ggml-cuda.h" // typedefs only (ggml_backend_cuda_host_register_mapped_t) -- the actual symbols are
                         // resolved dynamically via ggml_backend_reg_get_proc_address below, never linked directly,
                         // since the CUDA/HIP backend is a separate .so loaded at runtime (ggml_backend_load_all()).
 
-#include "llama-impl.h" // LLAMA_LOG_*
-
-#include <cstdio>
+#include <cinttypes>
+#include <condition_variable>
+#include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <map>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
 
-// -- host_src's custom "GPU buffer" wrapper: a real ggml_backend_buffer_t whose
-// .buft is the genuine GPU device buffer type (so the scheduler's backend/copy
-// resolution treats it as already resident there -- see
-// ggml_backend_sched_backend_from_buffer, which only checks buft identity) but
-// whose backing memory is the pre-registered+mapped host pointer, not a fresh
-// device allocation. No data ever moves through this buffer; it just lets ggml's
-// bookkeeping agree with what the GPU can already dereference directly.
+namespace {
 
-static void * host_view_buffer_get_base(ggml_backend_buffer_t buffer) {
-    return buffer->context;
-}
+struct layer_state {
+    llama_moe_cache_layer pub;
 
-static enum ggml_status host_view_buffer_init_tensor(ggml_backend_buffer_t, ggml_tensor *) {
-    return GGML_STATUS_SUCCESS;
-}
+    // non-owning; the moe_cache that owns this layer also owns one
+    // ggml_backend_t per device (see moe_cache::backends) that the worker
+    // thread dispatches this layer's async uploads through.
+    ggml_backend_t backend = nullptr;
 
-static void host_view_buffer_memset_tensor(ggml_backend_buffer_t, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
-    std::memset((char *) tensor->data + offset, value, size);
-}
+    // LRU bookkeeping (host side; the tables mirror expert_slot)
+    std::vector<int32_t>  slot_expert;   // slot -> expert id, -1 when empty
+    std::vector<int32_t>  expert_slot;   // expert id -> slot, -1 when uncached
+    std::vector<uint64_t> slot_last_use; // slot -> lamport clock of last hit
+    std::vector<int32_t>  pending;       // uncached ids observed since last step (dedup, obs order)
 
-static void host_view_buffer_set_tensor(ggml_backend_buffer_t, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-    std::memcpy((char *) tensor->data + offset, data, size);
-}
+    std::vector<bool>     slot_in_flight; // slot has an upload pending
 
-static void host_view_buffer_get_tensor(ggml_backend_buffer_t, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
-    std::memcpy(data, (const char *) tensor->data + offset, size);
-}
+    // scratch for flush_table's async dev_table write: must stay alive until
+    // that copy actually completes (the caller synchronizes before this
+    // could be overwritten again), so it can't be a function-local temporary.
+    std::vector<int32_t>  table_scratch;
 
-static void host_view_buffer_clear(ggml_backend_buffer_t, uint8_t) {
-    // no-op: this buffer aliases the model's own weight memory, never cleared
-}
-
-static const ggml_backend_buffer_i host_view_buffer_iface = {
-    /* .free_buffer   = */ nullptr, // we don't own the memory (the weight tensor / mmap does)
-    /* .get_base      = */ host_view_buffer_get_base,
-    /* .init_tensor   = */ host_view_buffer_init_tensor,
-    /* .memset_tensor = */ host_view_buffer_memset_tensor,
-    /* .set_tensor    = */ host_view_buffer_set_tensor,
-    /* .get_tensor    = */ host_view_buffer_get_tensor,
-    /* .set_tensor_2d = */ nullptr,
-    /* .get_tensor_2d = */ nullptr,
-    /* .cpy_tensor    = */ nullptr,
-    /* .clear         = */ host_view_buffer_clear,
-    /* .reset         = */ nullptr,
+    uint64_t n_hit  = 0;
+    uint64_t n_miss = 0;
 };
 
-llama_moe_expert_cache::llama_moe_expert_cache(ggml_backend_dev_t dev, int32_t cache_size) :
-    m_dev(dev), m_cache_size(cache_size) {
+struct upload_job {
+    size_t  layer_idx;
+    int32_t expert;
+    int32_t slot;
+    bool    done = false;
+};
 
-    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-    m_host_register_mapped_fn   = ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_register_mapped");
-    m_host_unregister_mapped_fn = ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_unregister_mapped");
+struct moe_cache {
+    int32_t n_slots     = 0;
+    int32_t max_inserts = 2;
 
-    if (!m_host_register_mapped_fn) {
-        LLAMA_LOG_WARN("%s: backend %s does not expose mapped host-memory registration; "
-                        "the MoE expert cache will refuse every register_weight() call\n",
-                        __func__, ggml_backend_dev_name(dev));
+    uint64_t clock   = 0;
+    uint64_t n_steps = 0;
+
+    std::mutex mtx; // guards pending lists + clock (observe runs during graph exec)
+
+    std::vector<layer_state> layers;
+    std::map<const ggml_tensor *, size_t> by_up_src;
+
+    std::vector<ggml_context *>         ctxs;
+    std::vector<ggml_backend_buffer_t>  bufs;
+
+    // one ggml_backend_t per device with cached layers, used by the worker
+    // thread to issue async (non-blocking) copies -- see upload_slice below.
+    // Owned here; freed in llama_moe_cache_shutdown.
+    std::map<ggml_backend_dev_t, ggml_backend_t> backends;
+    // guards all use of `backends` (dispatch + synchronize): the worker
+    // thread (uploads) and the main decode thread (flush_table's dev_table
+    // write, from llama_moe_cache_step()) both use the same per-device
+    // backend/stream, and ggml's CUDA/HIP backend context isn't documented
+    // as safe for concurrent enqueue from two host threads without this.
+    std::mutex backend_mtx;
+
+    // one-time host-memory pinning for the async worker's upload sources (see
+    // pin_host_source below): without this, ggml_backend_tensor_set() has to
+    // pin+unpin the source range on every single call (hsa_amd_memory_lock_to_pool),
+    // which measured as ~2.5s of a 20s decode window once inserts were flowing --
+    // more expensive than the blocking copy this whole design exists to avoid.
+    std::vector<std::pair<ggml_backend_cuda_host_unregister_mapped_t, void *>> pinned; // {unregister_fn, host_ptr}
+
+    // async upload worker: slices are copied to the device off the decode
+    // thread; the new table mapping is only published at a later step() once
+    // the upload has completed, so a running graph can never read a torn slot
+    std::thread              worker;
+    std::mutex               wmtx;
+    std::condition_variable  wcv;
+    std::deque<upload_job>   todo;
+    std::vector<upload_job>  done;
+    bool                     stop = false;
+};
+
+moe_cache * g_cache = nullptr;
+std::mutex g_init_mtx;
+bool g_init_done = false;
+
+int parse_layer_from_name(const char * name) {
+    // "blk.<il>.ffn_gate_exps.weight"
+    if (strncmp(name, "blk.", 4) != 0) {
+        return -1;
     }
+    return atoi(name + 4);
 }
 
-llama_moe_expert_cache::~llama_moe_expert_cache() {
-    if (!m_host_unregister_mapped_fn) {
+void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
+    moe_cache * mc = (moe_cache *) ud;
+
+    const int64_t n_ids    = ids->ne[0];
+    const int64_t n_tokens = ids->ne[1];
+    if (n_tokens > 4) {
+        return; // batch/prefill: the cache graph is not built there, don't pollute the LRU
+    }
+
+    const int il = parse_layer_from_name(name);
+    if (il < 0) {
         return;
     }
-    auto unregister_fn = (ggml_backend_cuda_host_unregister_mapped_t) m_host_unregister_mapped_fn;
-    for (auto & [weight, layer] : m_layers) {
-        if (layer.host_registered_ptr) {
-            unregister_fn(layer.host_registered_ptr);
-        }
-    }
-}
 
-bool llama_moe_expert_cache::has(const ggml_tensor * weight) const {
-    return m_layers.find(weight) != m_layers.end();
-}
-
-bool llama_moe_expert_cache::register_weight(const ggml_tensor * weight, int32_t n_expert_used_max) {
-    if (!m_host_register_mapped_fn) {
-        return false;
+    layer_state * ls = nullptr;
+    for (auto & l : mc->layers) {
+        if (l.pub.il == il) { ls = &l; break; }
     }
-    if (has(weight)) {
-        return true; // already registered (e.g. re-entrant model load path)
-    }
-    GGML_ASSERT(n_expert_used_max <= m_cache_size);
-    if (weight->data == nullptr) {
-        // llama_context can be constructed speculatively (e.g. common_fit_params'
-        // VRAM-fitting dry run) before the model's tensor data is actually loaded;
-        // silently decline here rather than abort -- the real load's llama_context
-        // construction will call register_weight again with valid data.
-        return false;
-    }
-    GGML_ASSERT(ggml_is_contiguous(weight));
-
-    const int32_t num_experts = (int32_t) weight->ne[2];
-    const int64_t row_elems   = weight->ne[0] * weight->ne[1];
-    const size_t  nbytes      = ggml_nbytes(weight);
-
-    auto register_fn = (ggml_backend_cuda_host_register_mapped_t) m_host_register_mapped_fn;
-    void * device_ptr = nullptr;
-    if (!register_fn(weight->data, nbytes, &device_ptr)) {
-        LLAMA_LOG_WARN("%s: failed to pin+map %s (%.1f MiB); leaving it on the static "
-                        "--n-cpu-moe CPU path\n", __func__, weight->name, nbytes / 1024.0 / 1024.0);
-        return false;
+    if (!ls) {
+        return;
     }
 
-    layer_state layer;
-    layer.host_registered_ptr = weight->data;
-
-    // GPU-resident bookkeeping + pool, own small ggml_context/buffer per layer.
-    {
-        ggml_init_params iparams{};
-        iparams.mem_size = 16 * ggml_tensor_overhead();
-        iparams.no_alloc = true;
-        layer.gpu_ctx = ggml_context_ptr(ggml_init(iparams));
-        ggml_context * ctx = layer.gpu_ctx.get();
-
-        layer.pool       = ggml_new_tensor_2d(ctx, weight->type, row_elems, m_cache_size);
-        layer.slot_of_id = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, num_experts);
-        layer.id_of_slot = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, m_cache_size);
-        layer.usage      = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, m_cache_size);
-        layer.step       = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 1);
-        // Sized to cache_size, not n_expert_used_max: apply()'s caller (build_lora_mm_id)
-        // only engages the cache when ggml_nelements(ids) <= cache_size, and a call's
-        // misses can never exceed its total ids count -- so cache_size is the true
-        // worst case here, and must match what that gate actually checks (n_expert_used
-        // alone under-covers multi-token calls, e.g. a short warmup prompt).
-        layer.src_idx    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, m_cache_size);
-        layer.dst_idx    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, m_cache_size);
-        layer.num_copy   = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 1);
-
-        ggml_backend_buffer_type_t gpu_buft = ggml_backend_dev_buffer_type(m_dev);
-        layer.gpu_buf = ggml_backend_buffer_ptr(ggml_backend_alloc_ctx_tensors_from_buft(ctx, gpu_buft));
-        if (!layer.gpu_buf) {
-            LLAMA_LOG_WARN("%s: failed to allocate GPU cache buffer for %s\n", __func__, weight->name);
-            if (m_host_unregister_mapped_fn) {
-                ((ggml_backend_cuda_host_unregister_mapped_t) m_host_unregister_mapped_fn)(weight->data);
+    std::lock_guard<std::mutex> lock(mc->mtx);
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        for (int64_t i = 0; i < n_ids; ++i) {
+            const int32_t id = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + i*ids->nb[0]);
+            if (id < 0 || id >= (int32_t) ls->expert_slot.size()) {
+                continue;
             }
-            return false;
+            const int32_t slot = ls->expert_slot[id];
+            if (slot >= 0) {
+                ls->n_hit++;
+                ls->slot_last_use[slot] = ++mc->clock;
+            } else {
+                ls->n_miss++;
+                bool dup = false;
+                for (int32_t p : ls->pending) {
+                    if (p == id) { dup = true; break; }
+                }
+                if (!dup) {
+                    ls->pending.push_back(id);
+                }
+            }
         }
-
-        // cold-start LRU state
-        std::vector<int32_t> neg1_experts(num_experts, -1);
-        std::vector<int32_t> neg1_slots(m_cache_size, -1);
-        std::vector<int64_t> zeros_slots(m_cache_size, 0);
-        int64_t zero64 = 0;
-        ggml_backend_tensor_set(layer.slot_of_id, neg1_experts.data(), 0, ggml_nbytes(layer.slot_of_id));
-        ggml_backend_tensor_set(layer.id_of_slot, neg1_slots.data(), 0, ggml_nbytes(layer.id_of_slot));
-        ggml_backend_tensor_set(layer.usage, zeros_slots.data(), 0, ggml_nbytes(layer.usage));
-        ggml_backend_tensor_set(layer.step, &zero64, 0, sizeof(int64_t));
     }
-
-    // host_src: a real tensor whose buffer's TYPE is the GPU device's own buffer
-    // type (so the scheduler resolves it to that backend, no copy inserted) but
-    // whose backing memory is the mapped host pointer we just registered.
-    {
-        ggml_init_params iparams{};
-        iparams.mem_size = 4 * ggml_tensor_overhead();
-        iparams.no_alloc = true;
-        layer.host_ctx = ggml_context_ptr(ggml_init(iparams));
-
-        ggml_tensor * host_src = ggml_new_tensor_2d(layer.host_ctx.get(), weight->type, row_elems, num_experts);
-        ggml_format_name(host_src, "%s.moe_cache_host_src", weight->name);
-
-        ggml_backend_buffer_type_t gpu_buft = ggml_backend_dev_buffer_type(m_dev);
-        layer.host_view_buf = ggml_backend_buffer_ptr(
-            ggml_backend_buffer_init(gpu_buft, host_view_buffer_iface, device_ptr, nbytes));
-        ggml_backend_tensor_alloc(layer.host_view_buf.get(), host_src, device_ptr);
-
-        layer.host_src = host_src;
-    }
-
-    m_layers.emplace(weight, std::move(layer));
-    LLAMA_LOG_INFO("%s: registered %s for the MoE expert cache (%d experts, cache_size=%d, %.1f MiB pinned+mapped)\n",
-                    __func__, weight->name, num_experts, m_cache_size, nbytes / 1024.0 / 1024.0);
-    return true;
 }
 
-std::pair<ggml_tensor *, ggml_tensor *> llama_moe_expert_cache::apply(
-        ggml_context * ctx0, const ggml_tensor * weight, ggml_tensor * ids) const {
+// Async: the CUDA/HIP backend's plain ggml_backend_tensor_set() does
+// cudaMemcpyAsync() immediately followed by a full cudaStreamSynchronize()
+// -- i.e. every "async" upload was actually blocking the worker thread on
+// its own individual copy, one at a time, with no pipelining. Measured at
+// ~70,000 such round-trips in a 20s decode window. Using the _async form
+// here (no implicit sync) and having the caller batch many of these before
+// one explicit ggml_backend_synchronize() lets the driver queue and overlap
+// them instead.
+void upload_slice(ggml_backend_t backend, ggml_tensor * dst_c, const ggml_tensor * src, int32_t expert, int32_t slot) {
+    const size_t sz = src->nb[2];
+    if ((size_t) slot*dst_c->nb[2] + sz > ggml_nbytes(dst_c) || (size_t) expert*sz + sz > ggml_nbytes(src)) {
+        LLAMA_LOG_ERROR("moe-cache: bad upload %s <- %s expert=%d slot=%d sz=%zu dst_nb2=%zu dst_bytes=%zu src_bytes=%zu\n",
+                dst_c->name, src->name, expert, slot, sz, dst_c->nb[2], ggml_nbytes(dst_c), ggml_nbytes(src));
+        return;
+    }
+    ggml_backend_tensor_set_async(backend, dst_c, (const char *) src->data + (size_t) expert*sz, (size_t) slot*dst_c->nb[2], sz);
+}
 
-    auto it = m_layers.find(weight);
-    GGML_ASSERT(it != m_layers.end());
-    const layer_state & layer = it->second;
+// Rewrites the WHOLE table from the current (in-memory, authoritative)
+// expert_slot array in one write per table, instead of one tiny
+// ggml_backend_tensor_set per changed entry. A layer can pick up several
+// evictions and several publishes in a single step() call (up to
+// max_inserts of each); batching means that costs 2 dispatches total for
+// the layer regardless of how many entries moved, not up to 2*2*max_inserts.
+// dev_table goes through the same async path as upload_slice -- this runs
+// on the main decode thread (from llama_moe_cache_step()), so avoiding a
+// blocking sync per dirty layer matters for decode latency directly, not
+// just worker throughput. host_table is a plain host-to-host memcpy either
+// way (no HSA round-trip), so it stays on the synchronous call.
+void flush_table(layer_state & ls, int32_t n_slots) {
+    const size_t n_expert = ls.expert_slot.size();
+    if (ls.table_scratch.size() != n_expert) {
+        ls.table_scratch.resize(n_expert);
+    }
+    for (size_t e = 0; e < n_expert; ++e) {
+        ls.table_scratch[e] = ls.expert_slot[e] >= 0 ? ls.expert_slot[e] : n_slots;
+    }
+    ggml_backend_tensor_set_async(ls.backend, ls.pub.dev_table, ls.table_scratch.data(), 0, n_expert*sizeof(int32_t));
+    ggml_backend_tensor_set(ls.pub.host_table, ls.table_scratch.data(), 0, n_expert*sizeof(int32_t));
+}
 
-    // Unlike ggml_mul_mat_id/ggml_add_id (which address `ids` via explicit nb[]
-    // strides), ggml_moe_lru_ensure's kernel reads it as a flat array -- so it
-    // needs a genuinely contiguous tensor. `ids` (the router's selected-experts
-    // output) is not guaranteed contiguous for n_tokens > 1; ggml_cont is a cheap
-    // copy at this size (a few dozen int32s) and the safest fix given the kernel
-    // already exists and works, vs. teaching it stride-aware addressing.
-    ggml_tensor * ids_cont = ggml_cont(ctx0, ids);
+// One-time host-memory pin+map for a weight tensor the async worker will read
+// slices out of repeatedly (up_src/gate_src/down_src). Without this,
+// ggml_backend_tensor_set() has to pin the source range on EVERY call
+// (hsa_amd_memory_lock_to_pool) since it's raw mmap'd GGUF data the driver has
+// never seen before -- measured at ~13us/call, and with up to
+// n_layers*max_inserts upload jobs/step x 3 tensors each, that adds up to
+// more wall-clock time than the blocking synchronous copy this design exists
+// to remove. Registering once here makes the driver treat the range as
+// already pinned for every later copy out of it. The returned mapped device
+// pointer isn't used for anything -- registration's side effect (pinning) is
+// the whole point, not the mapping.
+void pin_host_source(moe_cache * mc, ggml_backend_dev_t dev, ggml_tensor * w) {
+    if (w->data == nullptr) {
+        return;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    auto register_fn   = (ggml_backend_cuda_host_register_mapped_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_register_mapped");
+    auto unregister_fn = (ggml_backend_cuda_host_unregister_mapped_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_unregister_mapped");
+    if (!register_fn || !unregister_fn) {
+        LLAMA_LOG_WARN("%s: backend %s does not expose mapped host-memory registration; "
+                        "%s will pay a pin/unpin tax on every cache upload\n",
+                        __func__, ggml_backend_dev_name(dev), w->name);
+        return;
+    }
+    void * device_ptr = nullptr;
+    if (!register_fn(w->data, ggml_nbytes(w), &device_ptr)) {
+        LLAMA_LOG_WARN("%s: failed to pin+map %s (%.1f MiB); it will pay a pin/unpin tax on every "
+                        "cache upload instead\n", __func__, w->name, ggml_nbytes(w) / 1024.0 / 1024.0);
+        return;
+    }
+    mc->pinned.emplace_back(unregister_fn, w->data);
+}
 
-    ggml_tensor * remapped = ggml_moe_lru_ensure(
-        ctx0, ids_cont, layer.slot_of_id, layer.id_of_slot, layer.usage, layer.step,
-        layer.src_idx, layer.dst_idx, layer.num_copy, m_cache_size);
+} // namespace
 
-    ggml_tensor * pool_view = ggml_moe_expert_copy(
-        ctx0, layer.src_idx, layer.dst_idx, layer.num_copy, layer.host_src, layer.pool);
+void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t max_inserts) {
+    std::lock_guard<std::mutex> init_lock(g_init_mtx);
+    if (g_init_done) {
+        return;
+    }
+    [&]() {
+        if (n_slots <= 0) {
+            g_init_done = true;
+            return;
+        }
 
-    // ggml's dependency tracker only sees data flow through a node's `src[]` array;
-    // src_idx/dst_idx/num_copy are declared as INPUTS to both ops above (LRU_ENSURE
-    // mutates them in place, which ggml's graph builder has no way to know), so
-    // without this there is no edge forcing LRU_ENSURE to execute before
-    // EXPERT_COPY -- they can race, and EXPERT_COPY reading not-yet-written
-    // dst_idx/num_copy is exactly what produced the out-of-bounds pool writes
-    // this fixes. `remapped` is LRU_ENSURE's real declared output, so adding it
-    // as an (unused by the kernel, ordering-only) extra src here makes ggml's
-    // topological sort schedule LRU_ENSURE strictly first.
-    GGML_ASSERT(pool_view->src[5] == nullptr);
-    pool_view->src[5] = remapped;
+        auto * mc = new moe_cache();
+        mc->n_slots = n_slots;
+        if (max_inserts > 0) {
+            mc->max_inserts = max_inserts;
+        }
 
-    // pool/host_src are 2D ([row_elems, cache_size]) so the copy kernel can treat each
-    // expert as one flat contiguous chunk; mul_mat_id needs the original 3D per-expert
-    // shape back -- a free reshape view over the same (already correct) memory.
-    ggml_tensor * pool_3d = ggml_reshape_3d(ctx0, pool_view, weight->ne[0], weight->ne[1], m_cache_size);
+        // collect the host-resident expert layers, grouped by the device buffer
+        // type of that layer's router (the cache lives next to the router) --
+        // this is what makes a multi-GPU tensor-split placement correct: a
+        // layer whose OWN (non-expert) tensors landed on GPU1 gets its cache
+        // pool on GPU1 too, not forced onto whichever device happened to be
+        // first. No explicit per-layer device lookup needed.
+        struct cand { int il; const llama_layer * l; };
+        std::map<ggml_backend_buffer_type_t, std::vector<cand>> groups;
 
-    return { pool_3d, remapped };
+        for (size_t il = 0; il < model.layers.size(); ++il) {
+            const auto & l = model.layers[il];
+            if (!l.ffn_up_exps || !l.ffn_gate_exps || !l.ffn_down_exps || !l.ffn_gate_inp) {
+                continue;
+            }
+            if (!l.ffn_up_exps->data || !l.ffn_gate_exps->data || !l.ffn_down_exps->data) {
+                continue; // dry-run / memory-estimation model: weights not loaded, don't bind to it
+            }
+            if (!l.ffn_up_exps->buffer || !ggml_backend_buffer_is_host(l.ffn_up_exps->buffer)) {
+                continue; // experts already on a device: nothing to cache
+            }
+            if (!l.ffn_gate_inp->buffer || ggml_backend_buffer_is_host(l.ffn_gate_inp->buffer)) {
+                continue; // no device home for the cache
+            }
+            groups[ggml_backend_buffer_get_type(l.ffn_gate_inp->buffer)].push_back({(int) il, &l});
+        }
+
+        if (groups.empty()) {
+            LLAMA_LOG_INFO("%s: --moe-expert-cache-experts=%d set but no host-resident expert layers found - disabled\n", __func__, n_slots);
+            delete mc;
+            return; // NOT g_init_done = true: a later call (the real target
+                     // model's context, if this was the MTP draft's) may
+                     // still find real candidates and should get to try.
+        }
+
+        std::vector<cand> all;
+        for (auto & g : groups) {
+            all.insert(all.end(), g.second.begin(), g.second.end());
+        }
+
+        auto alloc_group = [&](ggml_backend_buffer_type_t buft, const std::vector<cand> & cands, bool tables_only) -> bool {
+            ggml_init_params ip = {
+                /*.mem_size  =*/ ggml_tensor_overhead()*(cands.size()*4 + 8),
+                /*.mem_buffer=*/ nullptr,
+                /*.no_alloc  =*/ true,
+            };
+            ggml_context * ctx = ggml_init(ip);
+            if (!ctx) {
+                return false;
+            }
+            mc->ctxs.push_back(ctx);
+
+            for (const auto & c : cands) {
+                layer_state * ls = nullptr;
+                for (auto & l : mc->layers) {
+                    if (l.pub.il == c.il) { ls = &l; break; }
+                }
+                if (!ls) {
+                    mc->layers.push_back({});
+                    ls = &mc->layers.back();
+                    ls->pub.il       = c.il;
+                    ls->pub.n_slots  = n_slots;
+                    ls->pub.up_src   = c.l->ffn_up_exps;
+                    ls->pub.gate_src = c.l->ffn_gate_exps;
+                    ls->pub.down_src = c.l->ffn_down_exps;
+                }
+
+                if (tables_only) {
+                    ls->pub.host_table = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, ls->pub.up_src->ne[2]);
+                    ggml_format_name(ls->pub.host_table, "moe_cache_htbl.%d", c.il);
+                } else {
+                    const ggml_tensor * u = c.l->ffn_up_exps;
+                    const ggml_tensor * g = c.l->ffn_gate_exps;
+                    const ggml_tensor * d = c.l->ffn_down_exps;
+                    ls->pub.up_c   = ggml_new_tensor_3d(ctx, u->type, u->ne[0], u->ne[1], n_slots + 1);
+                    ls->pub.gate_c = ggml_new_tensor_3d(ctx, g->type, g->ne[0], g->ne[1], n_slots + 1);
+                    ls->pub.down_c = ggml_new_tensor_3d(ctx, d->type, d->ne[0], d->ne[1], n_slots + 1);
+                    ls->pub.dev_table = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, u->ne[2]);
+                    ggml_format_name(ls->pub.up_c,      "moe_cache_up.%d",   c.il);
+                    ggml_format_name(ls->pub.gate_c,    "moe_cache_gate.%d", c.il);
+                    ggml_format_name(ls->pub.down_c,    "moe_cache_down.%d", c.il);
+                    ggml_format_name(ls->pub.dev_table, "moe_cache_tbl.%d",  c.il);
+
+                    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                    pin_host_source(mc, dev, c.l->ffn_up_exps);
+                    pin_host_source(mc, dev, c.l->ffn_gate_exps);
+                    pin_host_source(mc, dev, c.l->ffn_down_exps);
+
+                    ggml_backend_t & backend = mc->backends[dev];
+                    if (!backend) {
+                        backend = ggml_backend_dev_init(dev, nullptr);
+                    }
+                    ls->backend = backend;
+                }
+            }
+
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+            if (!buf) {
+                LLAMA_LOG_WARN("%s: failed to allocate MoE cache buffer on %s - cache disabled\n",
+                        __func__, ggml_backend_buft_name(buft));
+                return false;
+            }
+            ggml_backend_buffer_clear(buf, 0);
+            mc->bufs.push_back(buf);
+            return true;
+        };
+
+        bool ok = alloc_group(ggml_backend_cpu_buffer_type(), all, /*tables_only=*/true);
+        for (auto & g : groups) {
+            if (!ok) {
+                break;
+            }
+            ok = alloc_group(g.first, g.second, /*tables_only=*/false);
+        }
+
+        if (!ok) {
+            for (auto * b : mc->bufs) { ggml_backend_buffer_free(b); }
+            for (auto * c : mc->ctxs) { ggml_free(c); }
+            delete mc;
+            g_init_done = true; // a real model was seen and allocation failed: stay disabled
+            return;
+        }
+
+        // init LRU state + tables (everything uncached -> dummy slot n_slots)
+        size_t vram = 0;
+        for (auto & ls : mc->layers) {
+            const int64_t n_expert = ls.pub.up_src->ne[2];
+            ls.slot_expert.assign(n_slots, -1);
+            ls.expert_slot.assign(n_expert, -1);
+            ls.slot_last_use.assign(n_slots, 0);
+            ls.slot_in_flight.assign(n_slots, false);
+
+            std::vector<int32_t> dummy(n_expert, n_slots);
+            ggml_backend_tensor_set(ls.pub.dev_table,  dummy.data(), 0, n_expert*sizeof(int32_t));
+            ggml_backend_tensor_set(ls.pub.host_table, dummy.data(), 0, n_expert*sizeof(int32_t));
+
+            mc->by_up_src[ls.pub.up_src] = &ls - mc->layers.data();
+            vram += ggml_nbytes(ls.pub.up_c) + ggml_nbytes(ls.pub.gate_c) + ggml_nbytes(ls.pub.down_c);
+        }
+
+        mc->worker = std::thread([mc]() {
+            for (;;) {
+                std::vector<upload_job> batch;
+                {
+                    std::unique_lock<std::mutex> lk(mc->wmtx);
+                    mc->wcv.wait(lk, [mc]() { return mc->stop || !mc->todo.empty(); });
+                    if (mc->stop) {
+                        return;
+                    }
+                    // drain everything currently queued into one batch: each
+                    // upload_slice below is now a non-blocking dispatch, so
+                    // the whole batch's copies can be enqueued back-to-back
+                    // and confirmed with one synchronize per backend instead
+                    // of one blocking round-trip per tensor per expert.
+                    batch.reserve(mc->todo.size());
+                    while (!mc->todo.empty()) {
+                        batch.push_back(mc->todo.front());
+                        mc->todo.pop_front();
+                    }
+                }
+
+                {
+                    std::lock_guard<std::mutex> blk(mc->backend_mtx);
+                    for (const auto & j : batch) {
+                        auto & ls = mc->layers[j.layer_idx];
+                        upload_slice(ls.backend, ls.pub.up_c,   ls.pub.up_src,   j.expert, j.slot);
+                        upload_slice(ls.backend, ls.pub.gate_c, ls.pub.gate_src, j.expert, j.slot);
+                        upload_slice(ls.backend, ls.pub.down_c, ls.pub.down_src, j.expert, j.slot);
+                    }
+                    for (auto & [dev, backend] : mc->backends) {
+                        (void) dev;
+                        ggml_backend_synchronize(backend);
+                    }
+                }
+
+                std::lock_guard<std::mutex> lk(mc->wmtx);
+                for (auto j : batch) {
+                    j.done = true;
+                    mc->done.push_back(j);
+                }
+            }
+        });
+
+        ggml_set_moe_obs_callback(moe_obs_cb, mc);
+        g_cache = mc;
+        g_init_done = true;
+
+        LLAMA_LOG_WARN("%s: MoE expert cache active (async): %zu layer(s) x %d slots across %zu device(s), "
+                        "%d insert(s)/layer/step, %.1f MiB device memory\n",
+                        __func__, mc->layers.size(), n_slots, groups.size(), mc->max_inserts, vram/1024.0/1024.0);
+    }();
+}
+
+const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * up_exps) {
+    if (!g_cache) {
+        return nullptr;
+    }
+    auto it = g_cache->by_up_src.find(up_exps);
+    if (it == g_cache->by_up_src.end()) {
+        return nullptr;
+    }
+    return &g_cache->layers[it->second].pub;
+}
+
+void llama_moe_cache_step() {
+    moe_cache * mc = g_cache;
+    if (!mc) {
+        return;
+    }
+
+    // layers whose expert_slot table changed this call (eviction and/or
+    // publish) -- flushed to device/host tables once each at the end,
+    // instead of one tensor_set per changed entry.
+    std::vector<bool> dirty(mc->layers.size(), false);
+
+    // 1) publish completed uploads (sync point: no graph is executing)
+    {
+        std::lock_guard<std::mutex> wlk(mc->wmtx);
+        std::lock_guard<std::mutex> lk(mc->mtx);
+        for (const auto & j : mc->done) {
+            auto & ls = mc->layers[j.layer_idx];
+            ls.slot_expert[j.slot]     = j.expert;
+            ls.expert_slot[j.expert]   = j.slot;
+            ls.slot_last_use[j.slot]   = ++mc->clock;
+            ls.slot_in_flight[j.slot]  = false;
+            dirty[j.layer_idx] = true;
+        }
+        mc->done.clear();
+    }
+
+    std::lock_guard<std::mutex> lock(mc->mtx);
+    mc->n_steps++;
+
+    // 2) schedule new uploads: evict at a sync point (clear the victim's table
+    //    entry now), then hand the slice copies to the worker
+    for (size_t li = 0; li < mc->layers.size(); ++li) {
+        auto & ls = mc->layers[li];
+        if (ls.pending.empty()) {
+            continue;
+        }
+
+        int budget = mc->max_inserts;
+        for (auto it = ls.pending.rbegin(); it != ls.pending.rend() && budget > 0; ++it, --budget) {
+            const int32_t id = *it;
+            if (ls.expert_slot[id] >= 0) {
+                continue;
+            }
+
+            // victim: an empty non-in-flight slot if any, else the LRU non-in-flight slot
+            int32_t slot = -1;
+            uint64_t best = UINT64_MAX;
+            for (int32_t s = 0; s < mc->n_slots; ++s) {
+                if (ls.slot_in_flight[s]) {
+                    continue;
+                }
+                if (ls.slot_expert[s] < 0) { slot = s; break; }
+                if (ls.slot_last_use[s] < best) { best = ls.slot_last_use[s]; slot = s; }
+            }
+            if (slot < 0) {
+                break; // every slot is in flight; try again next step
+            }
+
+            const int32_t victim = ls.slot_expert[slot];
+            if (victim >= 0) {
+                ls.expert_slot[victim] = -1;
+                ls.slot_expert[slot]   = -1;
+                dirty[li] = true;
+            }
+            ls.slot_in_flight[slot] = true;
+
+            std::lock_guard<std::mutex> wlk(mc->wmtx);
+            mc->todo.push_back({li, id, slot});
+        }
+        ls.pending.clear();
+    }
+    mc->wcv.notify_one();
+
+    // 3) one table write per dirty layer, covering every change from both
+    //    steps above (publishes and evictions can land on the same layer
+    //    in the same call -- expert_slot already reflects the net result).
+    // The dev_table write is async (see flush_table) -- synchronize before
+    // returning so the update is actually visible before the next decode's
+    // graph reads it, and so table_scratch is safe to reuse next step().
+    {
+        bool any_dirty = false;
+        std::lock_guard<std::mutex> blk(mc->backend_mtx);
+        for (size_t li = 0; li < mc->layers.size(); ++li) {
+            if (dirty[li]) {
+                flush_table(mc->layers[li], mc->n_slots);
+                any_dirty = true;
+            }
+        }
+        if (any_dirty) {
+            for (auto & [dev, backend] : mc->backends) {
+                (void) dev;
+                ggml_backend_synchronize(backend);
+            }
+        }
+    }
+
+    if (mc->n_steps % 512 == 0) {
+        uint64_t h = 0, m = 0;
+        for (auto & ls : mc->layers) { h += ls.n_hit; m += ls.n_miss; }
+        LLAMA_LOG_DEBUG("moe-cache: steps=%" PRIu64 " hits=%" PRIu64 " misses=%" PRIu64 " hit-rate=%.1f%%\n",
+                mc->n_steps, h, m, h + m ? 100.0*h/(h + m) : 0.0);
+    }
+}
+
+void llama_moe_cache_shutdown() {
+    moe_cache * mc = g_cache;
+    if (!mc) {
+        return;
+    }
+    g_cache = nullptr;
+    ggml_set_moe_obs_callback(nullptr, nullptr);
+    {
+        std::lock_guard<std::mutex> lk(mc->wmtx);
+        mc->stop = true;
+    }
+    mc->wcv.notify_one();
+    if (mc->worker.joinable()) {
+        mc->worker.join();
+    }
+    for (auto & [unregister_fn, ptr] : mc->pinned) { unregister_fn(ptr); }
+    for (auto * b : mc->bufs) { ggml_backend_buffer_free(b); }
+    for (auto * c : mc->ctxs) { ggml_free(c); }
+    for (auto & [dev, backend] : mc->backends) { (void) dev; ggml_backend_free(backend); }
+    delete mc;
 }

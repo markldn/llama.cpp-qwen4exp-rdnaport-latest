@@ -583,9 +583,10 @@ struct common_params {
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
 
     // 0 = disabled (default). >0 = device-side GPU-resident LRU cache for MoE
-    // expert weights (CUDA/HIP only); see src/llama-moe-expert-cache.h and
-    // ~/.claude/plans/indexed-zooming-dream.md.
-    int32_t moe_expert_cache_size = 0;
+    // expert weights, cache misses served asynchronously (never blocks
+    // decode); see src/llama-moe-expert-cache.h.
+    int32_t moe_expert_cache_size    = 0;
+    int32_t moe_expert_cache_inserts = 2; // max expert uploads per layer per decode step
 
     bool single_turn       = false; // single turn chat conversation
 
