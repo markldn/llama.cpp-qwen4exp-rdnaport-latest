@@ -78,53 +78,63 @@ the code (see `src/llama-moe-expert-cache.cpp` and `src/llama-graph.cpp`):
   window. Fixed by switching to `ggml_backend_tensor_set_async` and draining the whole
   pending batch before one `ggml_backend_synchronize()` call.
 
-### Known limitation: MTP draft window capped at n-max=3
+### MTP draft window: n-max=4 crash, root-caused and fixed
 
-**`--spec-draft-n-max` above 3 will crash the server** when this cache is enabled. Verify
-batches are `n-max + 1` tokens; the cache's graph-building code hard-caps at 4 tokens
-(`n_tokens <= 4` in `src/llama-graph.cpp` and `src/llama-moe-expert-cache.cpp`) and this cap
-is load-bearing, not a conservative guess.
+`--spec-draft-n-max` above 3 used to crash the server with this cache enabled (verify
+batches are `n-max + 1` tokens; the cache's graph-building code capped at 4 tokens). That's
+now fixed for n-max up to 4 (5-token batches) — the fix, and how it was actually found, is
+worth documenting since it's a real bug in shared CUDA/HIP kernel code, not something
+specific to this fork's own logic.
 
-What was actually found chasing this down: raising the cap to allow 5-token batches
-(n-max=4) crashes with `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` — a genuine GPU
-out-of-bounds memory access inside a CUDA/HIP MMQ "quantize/scatter" kernel, confirmed with
-a live backtrace under `gdb`. It reproduces **only** with the cache enabled at 5-token
-batches — the same 5-token MTP batch runs cleanly with the cache disabled, which rules out a
-pre-existing MTP bug.
+**The bug.** A live `gdb` backtrace on the crash showed `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION`
+— a genuine GPU out-of-bounds write — inside `quantize_mmq_q8_1`'s scatter path
+(`ggml/src/ggml-cuda/quantize.cu`), reachable only with the cache active. Tracing it back:
+`mm_ids_helper` (`mmid.cu`) assumes a token's `n_expert_used` routed expert ids are
+distinct — true for ordinary top-k routing, but not for this cache, which remaps every
+currently-uncached expert to the same dummy slot id. When a token routes to that slot more
+than once (multiple simultaneously-uncached experts), the helper's per-(token,expert)
+compaction only records *one* of the duplicates, leaving the rest of its output buffer
+(`ids_src1`) uninitialized for that token. The scatter-quantize kernel then reads those
+slots unconditionally as destination row indices and writes to them — an unbounded write on
+whatever garbage happened to be sitting in that pool-allocated memory. (This turned out to
+match a bug independently found and reported against the exact upstream mechanism this cache
+is ported from — [PR #27861](https://github.com/ggml-org/llama.cpp/pull/27861) — by someone
+extending it to small batches with `compute-sanitizer`; credit to that report for confirming
+the diagnosis and pointing at the actual fix shape.)
 
-It's specifically tied to the cache's `n_as` (`n_slots + 1`, the number of "experts" the
-weight tensor exposes to the matmul kernel) being small compared to what MoE models normally
-have. A bisection-style sweep of `--moe-expert-cache-experts` at a fixed 5-token batch, 19
-data points from 8 to 512 slots, found an exceptionally clean threshold: every value with
-`n_as ≤ 185` crashed (9/9), every value with `n_as ≥ 186` survived (10/10) — a single-slot
-boundary, not noise. Real MoE models have hundreds of experts; this cache intentionally
-gives the kernel a much smaller "expert" count (dozens to low hundreds), a shape upstream's
-MMQ/quantize code most likely never gets exercised against.
+**The fix** (`ggml/src/ggml-cuda/mmq.cu`, `quantize.cu`): memset `ids_src1` to a `-1`
+sentinel before the helper runs, and skip the scatter write when a `-1` is read back. This is
+provably safe, not just defensive — the real MMQ matmul kernel downstream bounds all its
+reads to `expert_bounds`' properly-compacted ranges, so it never reads a duplicate-shadowed
+slot anyway; skipping the write just avoids touching memory nothing will consume.
 
-Reading the relevant kernel source (`ggml/src/ggml-cuda/mmid.cu`, `quantize.cu`, `mmq.cu`)
-didn't turn up an obvious off-by-one to patch: the buffers that actually scale with `n_as`
-(`expert_bounds`) are already sized correctly, and the ones that don't reference `n_as` in
-their own sizing at all — the real defect is buried deeper, most likely in
-`ggml_cuda_mul_mat_q_switch_type`'s kernel-variant/tiling dispatch, which is dense,
-GPU-architecture-specific code. Patching that without real confidence risks silent numerical
-corruption in *any* quantized MoE matmul this fork does, not just the cache path — a worse
-outcome than the current, well-understood cap.
+**Verification**: 600+ verify batches at `n_tokens=5` (n-max=4) with no crash, and
+**bit-identical** output vs. the no-cache path on the same low-entropy correctness prompts
+used everywhere else in this README — both at n-max=3 (regression check) and n-max=4 (the
+previously-crashing case). One thing worth knowing if you go looking yourself: on *creative*
+prompts, plain MTP at n-max=4 (even **with the cache off entirely**) already diverges from a
+non-speculative reference at temp=0 — that's a pre-existing characteristic of deeper verify
+windows in this fork (almost certainly batch-size-dependent floating-point differences in the
+attention/softmax kernels, a known class of behavior in this kind of software, not something
+this cache causes) — so don't use a creative-writing diff as your correctness test here; use
+a low-entropy one, as described below.
 
-Exploiting the boundary by just padding the cache to `n_as ≥ 186` isn't practically viable
-either: VRAM cost scales linearly with `n_as`, and the measured cost is ~119 MiB per slot
-*aggregated across all 40 cached layers* (11547 MiB / 97 slots on this model) — reaching
-`n_as = 186` would cost **~21.6 GB** for what's currently an 11.5 GB cache. Not usable
-alongside everything else that needs VRAM.
-
-So: the boundary is precisely known, but there's no cheap way to cross it safely. If you
-need a wider MTP window, don't raise the cap — use `--spec-draft-n-max 3` or lower with this
-cache, or drop to the synchronous design (linked above), which doesn't have this restriction.
+**Should you actually raise it?** Probably not, on its own — measured on this box, n-max=4
+was within noise of n-max=3 (19.13 vs 19.18 t/s pooled), so the shipped config here still
+uses n-max=3. The value of this fix is a real stability/correctness fix that happens to also
+open the door if your hardware or workload responds differently to a wider window — you'd
+need to measure that yourself. The cap now sits at `n_tokens <= 5` (n-max <= 4); if you want
+to push further, re-run the same verification (crash-free over many verify batches +
+bit-identical low-entropy diff) rather than just bumping the number — this class of bug is
+specifically about duplicate ids within a token's routed set, which doesn't get less likely
+as the batch grows.
 
 ### Correctness
 
-Verified via greedy (temp=0) decoding — far more sensitive to a data bug than stochastic
-sampling — against the plain `--n-cpu-moe` (no cache) build: **bit-identical** output, both
-at `n-max=3` and standalone (no MTP).
+Verified via greedy (temp=0) decoding on low-entropy prompts (e.g. "list the first 20 prime
+numbers") — far more sensitive to a data bug than stochastic sampling or open-ended
+creative/technical prompts — against the plain `--n-cpu-moe` (no cache) build:
+**bit-identical** output, standalone and with MTP at both n-max=3 and n-max=4.
 
 ## Benchmarks
 
