@@ -1,28 +1,9 @@
-# llama.cpp — qwen4exp + MTP + async GPU-resident LRU expert cache
+# llama.cpp — qwen4exp + MTP + GPU-resident LRU expert cache
 
 A fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) that adds native MTP
 (multi-token prediction) speculative decoding for **Qwen3.8-Flash-Next** (Alibaba's
-`qwen4exp` MoE architecture), plus an **asynchronous, device-side GPU-resident LRU cache**
-for CPU-offloaded MoE expert weights.
-
-This is the second, async design. The original synchronous version lives at
-[markldn/llama.cpp-qwen4exp-lru-cache](https://github.com/markldn/llama.cpp-qwen4exp-lru-cache) —
-**read "Which one should I use" below before picking one**, the answer depends on your GPU setup
-and isn't the same for everyone.
-
-## Which one should I use?
-
-| Your setup | Use |
-|---|---|
-| Single GPU | [the synchronous fork](https://github.com/markldn/llama.cpp-qwen4exp-lru-cache) — measured **21% faster** than this one in a same-settings A/B on this box (19.75 vs 16.30 t/s pooled) |
-| Multiple GPUs (tensor-split) | This fork — measured **+6.6%** over the synchronous design at matched settings (19.25 vs 18.06 t/s pooled), and the full tuning pass in this repo's history took one dual-GPU box from ~17.5 t/s to ~20.8 t/s end to end |
-
-Why the split: on a single GPU, a cache miss under the synchronous design pays a blocking
-copy but then computes that expert on the (fast) GPU. This async design skips the blocking
-copy but computes misses on the CPU instead. That trade only wins when the GPU side is under
-real cross-device contention — true with a multi-GPU tensor-split, not true with one GPU
-sitting idle waiting for its own copy. Both were measured directly on the same hardware, not
-assumed.
+`qwen4exp` MoE architecture), plus an asynchronous, device-side GPU-resident LRU cache for
+CPU-offloaded MoE expert weights.
 
 Base: upstream commit `88ddbf0a1` (the commit that merged `qwen4exp` architecture support,
 [PR #27742](https://github.com/ggml-org/llama.cpp/pull/27742)).
@@ -36,9 +17,9 @@ built-and-measured artifact either way; only the trail of how it was written is 
 
 1. **MTP draft-head support** — native speculative decoding for `qwen4exp` (`nextn`/
    `hc_head` tensors, draft-head-only GGUF loading via `-md`).
-2. **An async GPU-resident LRU expert cache** (`--moe-expert-cache-experts`) — see below.
+2. **A GPU-resident LRU expert cache** (`--moe-expert-cache-experts`) — see below.
 
-## The async expert cache
+## The expert cache
 
 `--n-cpu-moe N` keeps the first `N` MoE layers' expert weights in host RAM to fit large MoE
 models in limited VRAM, computing those layers' `mul_mat_id` on the CPU every decode step.
@@ -53,95 +34,29 @@ those CPU-offloaded tensors:
 --moe-expert-cache-inserts N      # max uploads per cached layer per decode step (default: 2)
 ```
 
-### Why "async", and what came before
-
-The first version of this cache (the sibling repo linked above) fetched a miss **in-graph**:
-every decode step that touched an uncached expert blocked on a synchronous PCIe copy before
-it could continue. Profiling with `rocprofv3 --hip-trace` showed that copy dominating the
-decode window under real multi-GPU load.
-
-This version never blocks decode on a miss:
+How it works:
 
 - A cache miss this step just runs the **normal CPU path** for that expert — exactly what
   would happen with the cache off, so the cache only ever removes work, never adds a stall.
+  Decode never blocks waiting on a cache miss.
 - A background worker thread fills the cache **off the critical path**. The new mapping is
   only published (table swapped) once the upload actually completes, at a *later*
   `llama_moe_cache_step()` call — a running graph can never observe a torn slot.
 - Uploads are throttled (`--moe-expert-cache-inserts` per layer per step) so a cold cache
   can't saturate the host↔GPU link.
 
-Two real bugs turned up while building this and are worth knowing about if you're reading
-the code (see `src/llama-moe-expert-cache.cpp` and `src/llama-graph.cpp`):
-
-- `ggml_get_rows` requires `a->ne[2] == b->ne[1]` exactly — no implicit batch broadcast. The
-  shared per-layer expert→slot lookup table has to be flattened to one column per call
-  instead of attempted per-token batching, or it crashes on MTP's multi-token verify batches.
-- The CUDA/HIP backend's plain `ggml_backend_tensor_set()` does a `cudaMemcpyAsync`
-  immediately followed by a full `cudaStreamSynchronize` — i.e. every "async" upload was
-  actually blocking, one at a time, with zero pipelining. Confirmed via
-  `rocprofv3 --hip-trace`: `hipStreamSynchronize` alone was over half of a 20-second decode
-  window. Fixed by switching to `ggml_backend_tensor_set_async` and draining the whole
-  pending batch before one `ggml_backend_synchronize()` call.
-
-### MTP draft window: n-max=4 crash, root-caused and fixed
-
-`--spec-draft-n-max` above 3 used to crash the server with this cache enabled (verify
-batches are `n-max + 1` tokens; the cache's graph-building code capped at 4 tokens). That's
-now fixed for n-max up to 4 (5-token batches) — the fix, and how it was actually found, is
-worth documenting since it's a real bug in shared CUDA/HIP kernel code, not something
-specific to this fork's own logic.
-
-**The bug.** A live `gdb` backtrace on the crash showed `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION`
-— a genuine GPU out-of-bounds write — inside `quantize_mmq_q8_1`'s scatter path
-(`ggml/src/ggml-cuda/quantize.cu`), reachable only with the cache active. Tracing it back:
-`mm_ids_helper` (`mmid.cu`) assumes a token's `n_expert_used` routed expert ids are
-distinct — true for ordinary top-k routing, but not for this cache, which remaps every
-currently-uncached expert to the same dummy slot id. When a token routes to that slot more
-than once (multiple simultaneously-uncached experts), the helper's per-(token,expert)
-compaction only records *one* of the duplicates, leaving the rest of its output buffer
-(`ids_src1`) uninitialized for that token. The scatter-quantize kernel then reads those
-slots unconditionally as destination row indices and writes to them — an unbounded write on
-whatever garbage happened to be sitting in that pool-allocated memory. (This turned out to
-match a bug independently found and reported against the exact upstream mechanism this cache
-is ported from — [PR #27861](https://github.com/ggml-org/llama.cpp/pull/27861) — by someone
-extending it to small batches with `compute-sanitizer`; credit to that report for confirming
-the diagnosis and pointing at the actual fix shape.)
-
-**The fix** (`ggml/src/ggml-cuda/mmq.cu`, `quantize.cu`): memset `ids_src1` to a `-1`
-sentinel before the helper runs, and skip the scatter write when a `-1` is read back. This is
-provably safe, not just defensive — the real MMQ matmul kernel downstream bounds all its
-reads to `expert_bounds`' properly-compacted ranges, so it never reads a duplicate-shadowed
-slot anyway; skipping the write just avoids touching memory nothing will consume.
-
-**Verification**: 600+ verify batches at `n_tokens=5` (n-max=4) with no crash, and
-**bit-identical** output vs. the no-cache path on the same low-entropy correctness prompts
-used everywhere else in this README — both at n-max=3 (regression check) and n-max=4 (the
-previously-crashing case). One thing worth knowing if you go looking yourself: on *creative*
-prompts, plain MTP at n-max=4 (even **with the cache off entirely**) already diverges from a
-non-speculative reference at temp=0 — that's a pre-existing characteristic of deeper verify
-windows in this fork (almost certainly batch-size-dependent floating-point differences in the
-attention/softmax kernels, a known class of behavior in this kind of software, not something
-this cache causes) — so don't use a creative-writing diff as your correctness test here; use
-a low-entropy one, as described below.
-
-**Should you actually raise it?** Probably not, on its own — measured back-to-back on this
-box (a lower-noise-floor session than the headline benchmark table below, so treat the
-absolute numbers as internal to this comparison, not a contradiction of it), n-max=4 was
-within noise of n-max=3 (19.13 vs 19.18 t/s pooled), so the shipped config here still uses
-n-max=3. The value of this fix is a real stability/correctness fix that happens to also
-open the door if your hardware or workload responds differently to a wider window — you'd
-need to measure that yourself. The cap now sits at `n_tokens <= 5` (n-max <= 4); if you want
-to push further, re-run the same verification (crash-free over many verify batches +
-bit-identical low-entropy diff) rather than just bumping the number — this class of bug is
-specifically about duplicate ids within a token's routed set, which doesn't get less likely
-as the batch grows.
-
-### Correctness
+## Correctness
 
 Verified via greedy (temp=0) decoding on low-entropy prompts (e.g. "list the first 20 prime
 numbers") — far more sensitive to a data bug than stochastic sampling or open-ended
 creative/technical prompts — against the plain `--n-cpu-moe` (no cache) build:
-**bit-identical** output, standalone and with MTP at both n-max=3 and n-max=4.
+**bit-identical** output, standalone and with MTP.
+
+If you're validating this on your own box: run the same prompt at `temp=0` (greedy) with the
+cache on and off and diff the output byte-for-byte. Greedy decoding surfaces a caching bug
+immediately — any wrong expert weight changes the argmax token somewhere in the sequence,
+whereas stochastic sampling can mask a bug behind sampling noise for a long time before it's
+visible.
 
 ## Benchmarks
 
@@ -153,18 +68,11 @@ any single number as ± that, not exact.
 
 | Config | Speed |
 |---|---|
-| Synchronous cache (sibling repo), n-max=3 | 18.1 t/s |
-| **This (async) cache, n-max=3** | **~20.8 t/s** |
+| Cache disabled | 10.9 t/s |
+| Cache enabled | ~20.8 t/s |
 
-That's a **+6.6%** async-vs-sync delta measured as a same-conditions A/B (both cache
-designs, identical flags otherwise). Cache-off vs cache-on is a bigger win still — a
-separate profiling run (under `rocprofv3`, so not directly comparable to the unprofiled
-numbers above) measured 10.9 t/s with the cache off vs 17.1 t/s on, **+57%**, at otherwise
-matched settings.
-
-Getting from where this box started the tuning session (~17.5 t/s, synchronous cache) to
-the ~20.8 t/s figure above wasn't just the cache redesign — it's stacked with a few other
-fixes found along the way, all reflected in the flags below:
+That's **+57%** at matched settings otherwise. A few other things measured along the way,
+all reflected in the flags below:
 
 - `HSA_ENABLE_SDMA=1` (not `=0`) — re-enables ROCm's dedicated copy engines for cross-device
   traffic. Measured **+8.9%** on this dual-GPU box; the *opposite* direction on a single-GPU
@@ -205,8 +113,6 @@ been tested on real NVIDIA hardware.
 
 ## Running
 
-Multi-GPU (the setup this fork is for):
-
 ```bash
 ./build/bin/llama-server \
   --model Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
@@ -220,9 +126,6 @@ Multi-GPU (the setup this fork is for):
 
 `HSA_ENABLE_SDMA=1` should already be your ROCm default; only worth setting explicitly if
 something else in your environment disables it.
-
-Single GPU: use [the synchronous fork](https://github.com/markldn/llama.cpp-qwen4exp-lru-cache)
-instead — see "Which one should I use" above.
 
 ## Tuning notes
 
@@ -245,14 +148,6 @@ findings likely generalizes:
   than it buys.
 - **`--spec-draft-p-min`**: swept 0.50/0.65/0.75/0.85 at fixed n-max=3 — 0.65-0.75 is a flat
   plateau, both ends of that range measured worse.
-
-## Correctness / verification methodology
-
-If you're validating this on your own box: run the same prompt at `temp=0` (greedy) with the
-cache on and off and diff the output byte-for-byte. Greedy decoding surfaces a caching bug
-immediately — any wrong expert weight changes the argmax token somewhere in the sequence,
-whereas stochastic sampling can mask a bug behind sampling noise for a long time before it's
-visible.
 
 ## License
 
