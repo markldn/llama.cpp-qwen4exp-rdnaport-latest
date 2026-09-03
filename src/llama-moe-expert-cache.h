@@ -71,6 +71,19 @@ struct llama_moe_cache_layer {
     ggml_tensor * host_table = nullptr;
 };
 
+// One-time host-memory pin (page-lock, in place -- no copy, no extra RAM) of
+// every --n-cpu-moe-offloaded expert weight tensor, independent of whether
+// the GPU-resident cache below is enabled. ggml-backend-sched's op-offload
+// path (GGML_OP_OFFLOAD_MIN_BATCH*) streams these same host-resident weights
+// to a GPU on the fly for large batches (prefill) regardless of the cache;
+// from unpinned (plain mmap'd) memory that copy goes through the driver's
+// bounce buffer at roughly half bandwidth. Call this once per model load,
+// before llama_moe_cache_init if the cache is also enabled -- that function
+// no longer pins its own tensors, it relies on this having already run.
+// Safe to call more than once (e.g. target + MTP draft); a no-op after the
+// first successful call.
+void llama_moe_pin_offloaded_experts(const llama_model & model);
+
 // Build the cache for every host-resident expert layer of the model. Safe to
 // call more than once (e.g. once per llama_context, target + MTP draft) --
 // only the first call that actually finds host-resident layers does work;

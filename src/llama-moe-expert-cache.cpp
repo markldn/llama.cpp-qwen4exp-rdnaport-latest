@@ -80,13 +80,6 @@ struct moe_cache {
     // as safe for concurrent enqueue from two host threads without this.
     std::mutex backend_mtx;
 
-    // one-time host-memory pinning for the async worker's upload sources (see
-    // pin_host_source below): without this, ggml_backend_tensor_set() has to
-    // pin+unpin the source range on every single call (hsa_amd_memory_lock_to_pool),
-    // which measured as ~2.5s of a 20s decode window once inserts were flowing --
-    // more expensive than the blocking copy this whole design exists to avoid.
-    std::vector<std::pair<ggml_backend_cuda_host_unregister_mapped_t, void *>> pinned; // {unregister_fn, host_ptr}
-
     // async upload worker: slices are copied to the device off the decode
     // thread; the new table mapping is only published at a later step() once
     // the upload has completed, so a running graph can never read a torn slot
@@ -101,6 +94,14 @@ struct moe_cache {
 moe_cache * g_cache = nullptr;
 std::mutex g_init_mtx;
 bool g_init_done = false;
+
+// Standalone host-memory pinning (llama_moe_pin_offloaded_experts), separate
+// from the GPU-resident cache above: guards its own idempotency and owns its
+// own unregister list, since it needs to work even when the cache itself is
+// disabled (n_slots == 0).
+std::mutex g_pin_mtx;
+bool g_pin_done = false;
+std::vector<std::pair<ggml_backend_cuda_host_unregister_mapped_t, void *>> g_pinned;
 
 int parse_layer_from_name(const char * name) {
     // "blk.<il>.ffn_gate_exps.weight"
@@ -198,18 +199,25 @@ void flush_table(layer_state & ls, int32_t n_slots) {
     ggml_backend_tensor_set(ls.pub.host_table, ls.table_scratch.data(), 0, n_expert*sizeof(int32_t));
 }
 
-// One-time host-memory pin+map for a weight tensor the async worker will read
-// slices out of repeatedly (up_src/gate_src/down_src). Without this,
-// ggml_backend_tensor_set() has to pin the source range on EVERY call
-// (hsa_amd_memory_lock_to_pool) since it's raw mmap'd GGUF data the driver has
-// never seen before -- measured at ~13us/call, and with up to
-// n_layers*max_inserts upload jobs/step x 3 tensors each, that adds up to
-// more wall-clock time than the blocking synchronous copy this design exists
-// to remove. Registering once here makes the driver treat the range as
-// already pinned for every later copy out of it. The returned mapped device
-// pointer isn't used for anything -- registration's side effect (pinning) is
-// the whole point, not the mapping.
-void pin_host_source(moe_cache * mc, ggml_backend_dev_t dev, ggml_tensor * w) {
+// One-time host-memory pin+map (page-lock the tensor's existing mmap'd
+// range in place -- no copy, no extra RAM) for a weight tensor that gets
+// read from repeatedly on the host->device path: either the cache's async
+// worker slicing individual experts out of it, or ggml-backend-sched's
+// op-offload path streaming the whole tensor to a GPU for a large batch.
+// Without this, every such copy has to pin the source range first
+// (hsa_amd_memory_lock_to_pool) since it's raw mmap'd GGUF data the driver
+// has never seen before -- measured at ~13us/call for the cache's small
+// per-expert slices, and unpinned host->device copies more broadly go
+// through the driver's bounce buffer at roughly half bandwidth instead of
+// direct async DMA. Registering once here makes the driver treat the range
+// as already pinned for every later copy out of it. The returned mapped
+// device pointer isn't used for anything -- registration's side effect
+// (pinning) is the whole point, not the mapping. Appends to `out` on
+// success so the caller can release it at shutdown; silently leaves the
+// tensor unpinned (falling back to the per-call pin/unpin tax) if the
+// active backend doesn't expose this registration API.
+void pin_host_source(ggml_backend_dev_t dev, ggml_tensor * w,
+        std::vector<std::pair<ggml_backend_cuda_host_unregister_mapped_t, void *>> & out) {
     if (w->data == nullptr) {
         return;
     }
@@ -218,20 +226,67 @@ void pin_host_source(moe_cache * mc, ggml_backend_dev_t dev, ggml_tensor * w) {
     auto unregister_fn = (ggml_backend_cuda_host_unregister_mapped_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_unregister_mapped");
     if (!register_fn || !unregister_fn) {
         LLAMA_LOG_WARN("%s: backend %s does not expose mapped host-memory registration; "
-                        "%s will pay a pin/unpin tax on every cache upload\n",
+                        "%s will pay a pin/unpin tax on every host<->device copy\n",
                         __func__, ggml_backend_dev_name(dev), w->name);
         return;
     }
     void * device_ptr = nullptr;
     if (!register_fn(w->data, ggml_nbytes(w), &device_ptr)) {
         LLAMA_LOG_WARN("%s: failed to pin+map %s (%.1f MiB); it will pay a pin/unpin tax on every "
-                        "cache upload instead\n", __func__, w->name, ggml_nbytes(w) / 1024.0 / 1024.0);
+                        "host<->device copy instead\n", __func__, w->name, ggml_nbytes(w) / 1024.0 / 1024.0);
         return;
     }
-    mc->pinned.emplace_back(unregister_fn, w->data);
+    out.emplace_back(unregister_fn, w->data);
 }
 
 } // namespace
+
+void llama_moe_pin_offloaded_experts(const llama_model & model) {
+    std::lock_guard<std::mutex> lock(g_pin_mtx);
+    if (g_pin_done) {
+        return;
+    }
+    if (model.devices.empty()) {
+        g_pin_done = true; // nothing GPU-side to resolve the pin API through
+        return;
+    }
+    ggml_backend_dev_t dev = model.devices[0].dev; // host pinning isn't per-device; any loaded GPU backend's registry works
+
+    size_t n_pinned = 0;
+    size_t bytes_pinned = 0;
+    for (const auto & l : model.layers) {
+        if (!l.ffn_up_exps || !l.ffn_gate_exps || !l.ffn_down_exps) {
+            continue;
+        }
+        if (!l.ffn_up_exps->data || !l.ffn_gate_exps->data || !l.ffn_down_exps->data) {
+            continue; // dry-run / memory-estimation model: weights not loaded
+        }
+        if (!l.ffn_up_exps->buffer || !ggml_backend_buffer_is_host(l.ffn_up_exps->buffer)) {
+            continue; // not offloaded to host: nothing to pin
+        }
+        const size_t before = g_pinned.size();
+        pin_host_source(dev, l.ffn_up_exps,   g_pinned);
+        pin_host_source(dev, l.ffn_gate_exps, g_pinned);
+        pin_host_source(dev, l.ffn_down_exps, g_pinned);
+        for (size_t i = before; i < g_pinned.size(); ++i) {
+            n_pinned++;
+        }
+        bytes_pinned += ggml_nbytes(l.ffn_up_exps) + ggml_nbytes(l.ffn_gate_exps) + ggml_nbytes(l.ffn_down_exps);
+    }
+
+    if (n_pinned == 0) {
+        return; // NOT g_pin_done = true: this model (e.g. a fully GPU-resident MTP
+                 // draft head) genuinely has nothing to pin, but a later call for
+                 // the real target model's context should still get to try
+    }
+    // WARN, not INFO: this fork's LLAMA_LOG_INFO from this file doesn't surface at
+    // the server's default verbosity (a logging-tag/verbosity filtering nuance),
+    // same reason the cache's own "active" announcement below uses WARN too.
+    LLAMA_LOG_WARN("%s: pinned %zu host-resident MoE expert tensor(s), %.1f MiB, for full-bandwidth "
+                    "host<->device DMA (cache uploads and/or ggml-backend-sched's op-offload streaming)\n",
+                    __func__, n_pinned, bytes_pinned / 1024.0 / 1024.0);
+    g_pin_done = true;
+}
 
 void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t max_inserts) {
     std::lock_guard<std::mutex> init_lock(g_init_mtx);
@@ -332,10 +387,11 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
                     ggml_format_name(ls->pub.down_c,    "moe_cache_down.%d", c.il);
                     ggml_format_name(ls->pub.dev_table, "moe_cache_tbl.%d",  c.il);
 
+                    // Source-tensor pinning happens in llama_moe_pin_offloaded_experts,
+                    // called before this from llama-context.cpp -- not here, since that
+                    // pass covers every offloaded expert layer regardless of whether the
+                    // cache ends up tracking it.
                     ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-                    pin_host_source(mc, dev, c.l->ffn_up_exps);
-                    pin_host_source(mc, dev, c.l->ffn_gate_exps);
-                    pin_host_source(mc, dev, c.l->ffn_down_exps);
 
                     ggml_backend_t & backend = mc->backends[dev];
                     if (!backend) {
@@ -572,7 +628,6 @@ void llama_moe_cache_shutdown() {
     if (mc->worker.joinable()) {
         mc->worker.join();
     }
-    for (auto & [unregister_fn, ptr] : mc->pinned) { unregister_fn(ptr); }
     for (auto * b : mc->bufs) { ggml_backend_buffer_free(b); }
     for (auto * c : mc->ctxs) { ggml_free(c); }
     for (auto & [dev, backend] : mc->backends) { (void) dev; ggml_backend_free(backend); }

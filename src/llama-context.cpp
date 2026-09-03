@@ -398,12 +398,23 @@ llama_context::llama_context(
         memory.reset(model.create_memory(params_mem, cparams));
     }
 
-    if (!hparams.vocab_only && cparams.moe_expert_cache_size > 0) {
-        // Async GPU-resident LRU cache for host-offloaded MoE experts (see
-        // llama-moe-expert-cache.h). Global singleton: safe to call once per
-        // context (target + MTP draft both construct one), only the first
-        // call that finds real host-resident layers does anything.
-        llama_moe_cache_init(model, cparams.moe_expert_cache_size, cparams.moe_expert_cache_inserts);
+    if (!hparams.vocab_only) {
+        // Pin every --n-cpu-moe-offloaded expert weight tensor's existing mmap'd
+        // memory in place (see llama-moe-expert-cache.h), independent of whether
+        // the GPU-resident cache below is enabled: ggml-backend-sched's op-offload
+        // path streams these same host-resident weights to a GPU on the fly for
+        // large batches (prefill) regardless of the cache, and that copy is much
+        // faster from pinned memory. Must run before llama_moe_cache_init, which
+        // no longer pins its own tensors.
+        llama_moe_pin_offloaded_experts(model);
+
+        if (cparams.moe_expert_cache_size > 0) {
+            // Async GPU-resident LRU cache for host-offloaded MoE experts (see
+            // llama-moe-expert-cache.h). Global singleton: safe to call once per
+            // context (target + MTP draft both construct one), only the first
+            // call that finds real host-resident layers does anything.
+            llama_moe_cache_init(model, cparams.moe_expert_cache_size, cparams.moe_expert_cache_inserts);
+        }
     }
 
     // init backends
