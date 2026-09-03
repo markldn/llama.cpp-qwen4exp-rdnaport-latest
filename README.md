@@ -27,6 +27,11 @@ assumed.
 Base: upstream commit `88ddbf0a1` (the commit that merged `qwen4exp` architecture support,
 [PR #27742](https://github.com/ggml-org/llama.cpp/pull/27742)).
 
+This repo is published as a squashed snapshot (one commit, no incremental history) rather
+than the full commit-by-commit history against that base — `git log` here won't show
+upstream's history or the intermediate steps that produced this fork. The code is the real,
+built-and-measured artifact either way; only the trail of how it was written is missing.
+
 ## What's different from upstream
 
 1. **MTP draft-head support** — native speculative decoding for `qwen4exp` (`nextn`/
@@ -119,9 +124,11 @@ attention/softmax kernels, a known class of behavior in this kind of software, n
 this cache causes) — so don't use a creative-writing diff as your correctness test here; use
 a low-entropy one, as described below.
 
-**Should you actually raise it?** Probably not, on its own — measured on this box, n-max=4
-was within noise of n-max=3 (19.13 vs 19.18 t/s pooled), so the shipped config here still
-uses n-max=3. The value of this fix is a real stability/correctness fix that happens to also
+**Should you actually raise it?** Probably not, on its own — measured back-to-back on this
+box (a lower-noise-floor session than the headline benchmark table below, so treat the
+absolute numbers as internal to this comparison, not a contradiction of it), n-max=4 was
+within noise of n-max=3 (19.13 vs 19.18 t/s pooled), so the shipped config here still uses
+n-max=3. The value of this fix is a real stability/correctness fix that happens to also
 open the door if your hardware or workload responds differently to a wider window — you'd
 need to measure that yourself. The cap now sits at `n_tokens <= 5` (n-max <= 4); if you want
 to push further, re-run the same verification (crash-free over many verify batches +
