@@ -89,7 +89,8 @@ all reflected in the flags below:
   CPU, 6 threads beat 4, 8, and 10; **12 threads (the full logical count) hung the server
   outright** rather than just running slower. Don't default to `nproc`.
 - `--moe-expert-cache-experts 96` / `--n-cpu-moe 40` / `--moe-expert-cache-inserts 4` are
-  this box's measured sweep optimum, not defaults to copy blindly — see "Tuning" below.
+  this box's measured sweep optimum, not defaults to copy blindly — re-tune for your own
+  VRAM budget and GPU count.
 
 Actual speedup depends heavily on model, quant, hardware, and `--n-cpu-moe`/context-size
 tuning. The numbers above are one box's measurements, not a general guarantee.
@@ -126,28 +127,6 @@ been tested on real NVIDIA hardware.
 
 `HSA_ENABLE_SDMA=1` should already be your ROCm default; only worth setting explicitly if
 something else in your environment disables it.
-
-## Tuning notes
-
-Numbers you should re-derive on your own hardware, not copy — but the *shape* of these
-findings likely generalizes:
-
-- **`--moe-expert-cache-experts` (cache size) has a real ceiling, and it isn't gentle.** On
-  this box, sweeping 80/96/112/128/144 at fixed `--n-cpu-moe 40`: 96 was the local optimum,
-  128 OOM'd outright at startup, and 144 loaded but ran at roughly a third of the
-  hit-rate-appropriate speed (VRAM too tight, thrashing) — going too big is worse than going
-  too small.
-- **VRAM on a "minority" tensor-split card fills up fast.** At `--tensor-split 87,13` and
-  `--ctx-size 262144`, the 16GB card was already ~97.5% used with the cache's whole capacity
-  landing on the other (main) GPU. Shifting the split to push more cache capacity onto the
-  smaller card OOM'd immediately at every ratio tried (80/20, 75/25, 70/30) — there was no
-  headroom to redistribute without cutting context size first.
-- **`--moe-expert-cache-inserts`**: swept 1/2/4/8 at fixed cache size — 4 (the point where
-  this repo's default already sits, if you pass no flag it's 2) was the clear local optimum
-  on this box; 1 starves the cache, 8 adds enough background upload traffic to cost more
-  than it buys.
-- **`--spec-draft-p-min`**: swept 0.50/0.65/0.75/0.85 at fixed n-max=3 — 0.65-0.75 is a flat
-  plateau, both ends of that range measured worse.
 
 ## License
 
