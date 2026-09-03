@@ -44,6 +44,11 @@ How it works:
   `llama_moe_cache_step()` call — a running graph can never observe a torn slot.
 - Uploads are throttled (`--moe-expert-cache-inserts` per layer per step) so a cold cache
   can't saturate the host↔GPU link.
+- Every `--n-cpu-moe`-offloaded expert weight tensor gets host-memory pinned (page-locked in
+  place, no copy) at load time — this happens whenever offloaded experts exist, independent
+  of whether the cache above is even enabled. It speeds up both the cache's own uploads and
+  `ggml-backend-sched`'s separate op-offload path (which streams these same weights to a GPU
+  for large batches like prefill, cache or no cache) — see Benchmarks.
 
 ## Correctness
 
@@ -91,6 +96,14 @@ all reflected in the flags below:
 - `--moe-expert-cache-experts 96` / `--n-cpu-moe 40` / `--moe-expert-cache-inserts 4` are
   this box's measured sweep optimum, not defaults to copy blindly — re-tune for your own
   VRAM budget and GPU count.
+- **Prefill**: every `--n-cpu-moe`-offloaded expert weight tensor gets host-memory pinned
+  (page-locked in place, no copy) at load time, not just the ones the cache tracks —
+  `ggml-backend-sched`'s own op-offload path streams these same weights to a GPU for large
+  batches (prefill) regardless of whether the cache is enabled, and that copy is much faster
+  from pinned memory (direct async DMA) than from plain mmap'd memory (routed through the
+  driver's bounce buffer at roughly half bandwidth). Measured **+41%** prefill throughput
+  (253 → 357 tok/s pooled, 35 offloaded layers, ~3600-token prompt) for a fixed one-time load
+  cost of **+3.9s** (pinning ~53GB of host memory). This applies with the cache on or off.
 
 Actual speedup depends heavily on model, quant, hardware, and `--n-cpu-moe`/context-size
 tuning. The numbers above are one box's measurements, not a general guarantee.
