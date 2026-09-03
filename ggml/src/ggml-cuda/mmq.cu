@@ -192,6 +192,30 @@ void ggml_cuda_mul_mat_q(
     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
 
+    // mm_ids_helper's compaction assumes a token's n_expert_used routed ids are
+    // distinct (true for ordinary top-k routing, never producing duplicates).
+    // The llama MoE expert cache breaks that: every currently-uncached expert
+    // for a token remaps to the same dummy slot id, so a token can route to
+    // that one id multiple times. When it does, the helper's per-(token,
+    // expert) compaction only records one of the duplicates (see mmid.cu's
+    // it_compact accounting), leaving the rest of ids_src1 uninitialized for
+    // that token. quantize_mmq_q8_1's scatter path (quantize.cu) then reads
+    // those uninitialized slots as raw destination-row indices and writes to
+    // them unconditionally -- an unbounded pool-memory write (confirmed via a
+    // live gdb backtrace: HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION inside
+    // this exact kernel, only reproducible with the cache active).
+    // The real MMQ matmul kernel downstream bounds all its reads to
+    // expert_bounds' properly-compacted ranges, so it never reads these
+    // duplicate-shadowed slots anyway -- skipping their write is provably
+    // safe, not just defensive. -1 sentinel + the skip-guard added in
+    // quantize.cu is a cheap, correctness-only fix (a few hundred bytes per
+    // call), left unconditional rather than gated on dedup_bcast/the cache
+    // being active since any future duplicate-id producer would hit the same
+    // uninitialized-read bug otherwise.
+    if (ids_src1.get()) {
+        CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), 0xFF, ne_get_rows * sizeof(int32_t), stream));
+    }
+
     {
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
         const int si1  = ids->nb[1] / ggml_element_size(ids);

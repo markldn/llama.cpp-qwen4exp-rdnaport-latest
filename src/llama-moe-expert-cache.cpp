@@ -115,7 +115,7 @@ void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
 
     const int64_t n_ids    = ids->ne[0];
     const int64_t n_tokens = ids->ne[1];
-    if (n_tokens > 4) {
+    if (n_tokens > 5) {
         return; // batch/prefill: the cache graph is not built there, don't pollute the LRU
     }
 

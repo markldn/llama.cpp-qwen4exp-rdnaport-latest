@@ -527,6 +527,18 @@ static __global__ void quantize_mmq_q8_1(
         int64_t ib;
         if constexpr (scatter) {
             const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+            // -1 sentinel (see the memset before ggml_cuda_launch_mm_ids_helper
+            // in mmq.cu): this slot was never assigned a compacted row because
+            // this token routed to the same expert id more than once (the
+            // llama MoE expert cache's uncached-dummy-slot collision case).
+            // The real MMQ matmul kernel never reads a row here (it bounds
+            // reads to expert_bounds' compacted count), so skipping the write
+            // is safe -- reading `i` as a row index here without this guard is
+            // an unbounded out-of-bounds write into y[] for that stale/garbage
+            // value.
+            if (i < 0) {
+                continue;
+            }
             ib = k_block*ne1 + i;
         } else {
             const int64_t ib0 = blockIdx.z*((int64_t)gridDim.x*gridDim.y*blockDim.x/QK8_1); // first block of channel

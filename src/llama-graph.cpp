@@ -2110,8 +2110,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // by the CPU chain (src[3] table, set below on up/gate/down) and served by
     // the cache chain instead; uncached ids map to the cache's zero slot. The
     // two chains' outputs are summed, exact either way.
-    // n_tokens<=4 covers decode (1) and small MTP speculative-verify batches
-    // (n-max+1 tokens in one call, e.g. 4 for n-max=3) -- matches the cap
+    // n_tokens<=5 covers decode (1) and small MTP speculative-verify batches
+    // (n-max+1 tokens in one call, e.g. 5 for n-max=4) -- matches the cap
     // moe_obs_cb already uses to decide what's worth feeding the LRU (real
     // prefill batches are excluded there too). No cache_size/batch-size
     // relationship needed here (unlike the old synchronous design): misses
@@ -2119,22 +2119,32 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // the batch size, so there's no capacity case where the cache "does
     // nothing" for an oversized call.
     //
-    // DO NOT raise this cap without first root-causing a real crash found
-    // 2026-09-03 testing n-max=4 (5-token verify batches): "ROCm error,
-    // current device: -1" inside ggml_backend_cuda_synchronize, called from
-    // the MAIN graph's own compute path (not the cache's worker thread) --
-    // see llama_moe_cache_init's per-device ggml_backend_t (moe_cache::
-    // backends / layer_state::backend in llama-moe-expert-cache.cpp). Likely
-    // cause: an independently-created ggml_backend_t for a device that
-    // already has one owned by the main llama_context isn't safe to use
-    // concurrently under ROCm even with backend_mtx serializing the actual
-    // tensor_set_async/synchronize calls -- something in the per-device
-    // HIP/driver state two separate backend *contexts* touch may not be as
-    // externally-lockable as assumed. n-max=3 (n_tokens<=4) is verified
-    // correct and stable; don't extend past it without investigating this.
+    // Real root cause of the 2026-09-03 crash at n-max=4, and the actual fix,
+    // is in ggml/src/ggml-cuda/{mmq.cu,quantize.cu} -- NOT a cross-thread
+    // backend-concurrency issue (that was the first, wrong theory). The real
+    // bug: mm_ids_helper (mmid.cu) assumes a token's n_expert_used routed ids
+    // are distinct, true for ordinary top-k routing but not for this cache,
+    // which remaps every currently-uncached expert to the same dummy slot --
+    // a token can route to that slot id more than once. The helper's
+    // per-(token,expert) compaction only records one of the duplicates,
+    // leaving the rest of ids_src1 uninitialized; quantize_mmq_q8_1's scatter
+    // path (quantize.cu) then reads those slots unconditionally as
+    // destination-row indices, an unbounded write on garbage data (confirmed
+    // via a live gdb backtrace: HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION
+    // inside that exact kernel, reproducing only with the cache active).
+    // Fixed with a -1 sentinel memset on ids_src1 before the helper runs
+    // (mmq.cu) plus a skip-guard in the scatter kernel (quantize.cu) -- the
+    // real MMQ matmul kernel downstream bounds all its reads to
+    // expert_bounds' properly-compacted ranges, so it never reads a
+    // duplicate-shadowed slot anyway, making the skip provably safe rather
+    // than just defensive. Verified: 600+ verify batches at n_tokens=5 with
+    // no crash, and bit-identical output vs the no-cache path on the
+    // low-entropy correctness prompts (see README). n_tokens<=5 (n-max<=4) is
+    // what's actually been validated; raising further should get the same
+    // treatment -- re-verify the fix still holds, don't just bump the cap.
     const llama_moe_cache_layer * mcache = nullptr;
     ggml_tensor * mc_slot_ids = nullptr;
-    if (n_tokens >= 1 && n_tokens <= 4 && !gate_up_exps && gate_exps && down_exps &&
+    if (n_tokens >= 1 && n_tokens <= 5 && !gate_up_exps && gate_exps && down_exps &&
         !up_exps_b && !gate_exps_b && !down_exps_b &&
         !up_exps_s && !gate_exps_s && !down_exps_s &&
         type_op == LLM_FFN_SILU && !weight_before_ffn && loras->empty()) {
