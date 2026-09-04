@@ -7,6 +7,8 @@
 
 #define LLAMA_MAX_SEQ 256
 
+struct llama_moe_dynamic_k;
+
 struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
@@ -18,6 +20,22 @@ struct llama_cparams {
     uint32_t n_outputs_max_per_seq;
     int32_t  n_threads;       // number of threads to use for generation
     int32_t  n_threads_batch; // number of threads to use for batch processing
+
+    // override n_expert_used for prefill ubatches (n_seq_tokens > 1); see llama-graph.cpp.
+    // 0 = disabled, use the model's own n_expert_used for everything. Used as the K for the
+    // first prefill ubatch of a run even when n_expert_used_adaptive is on (see below), since
+    // there's nothing observed yet to derive a K from at that point.
+    int32_t  n_expert_used_prefill = 0;
+
+    // override n_expert_used for every non-prefill ubatch (ordinary decode AND speculative-decode
+    // verify batches); see llama-graph.cpp. 0 = disabled, use the model's own n_expert_used.
+    int32_t  n_expert_used_decode = 0;
+
+    // confidence-based dynamic K for prefill; see llama-moe-dynamic-k.h. Owned by the
+    // llama_context that set this (non-null only when n_expert_used_adaptive or
+    // n_expert_used_adaptive_log was requested).
+    struct llama_moe_dynamic_k * moe_dynamic_k = nullptr;
+    bool n_expert_used_adaptive = false; // apply moe_dynamic_k's suggested K to prefill ubatches
 
     int32_t  nextn_layer_offset = 0;
 

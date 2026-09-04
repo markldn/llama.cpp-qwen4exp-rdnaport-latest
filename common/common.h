@@ -459,6 +459,16 @@ struct common_params {
     int32_t grp_attn_n            =     1; // group-attention factor
     int32_t grp_attn_w            =   512; // group-attention width
     int32_t n_print               =    -1; // print token count every n tokens (-1 = disabled)
+    int32_t n_expert_used_prefill =     0; // override n_expert_used for prefill ubatches (n_seq_tokens > 1); 0 = disabled
+    int32_t n_expert_used_decode  =     0; // override n_expert_used for every non-prefill ubatch (decode + spec-decode verify); 0 = disabled
+
+    // confidence-based dynamic K for prefill; see src/llama-moe-dynamic-k.h
+    bool    n_expert_used_adaptive          = false; // apply the suggested K to prefill ubatches
+    bool    n_expert_used_adaptive_log      = false; // log confidence/suggested K every prefill ubatch
+    int32_t n_expert_used_adaptive_layer    =    -1; // router layer to watch, -1 = auto (n_layer / 2)
+    int32_t n_expert_used_adaptive_k_min    =     4; // K at n_expert_used_adaptive_conf_high
+    float   n_expert_used_adaptive_conf_low  = 0.2f; // confidence <= this -> full n_expert_used
+    float   n_expert_used_adaptive_conf_high = 0.5f; // confidence >= this -> n_expert_used_adaptive_k_min
     float   rope_freq_base        =  0.0f; // RoPE base frequency
     float   rope_freq_scale       =  0.0f; // RoPE frequency scaling factor
     float   yarn_ext_factor       = -1.0f; // YaRN extrapolation mix factor

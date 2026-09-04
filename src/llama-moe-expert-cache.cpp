@@ -613,6 +613,18 @@ void llama_moe_cache_step() {
     }
 }
 
+void llama_moe_cache_gpu_lock() {
+    if (g_cache) {
+        g_cache->backend_mtx.lock();
+    }
+}
+
+void llama_moe_cache_gpu_unlock() {
+    if (g_cache) {
+        g_cache->backend_mtx.unlock();
+    }
+}
+
 void llama_moe_cache_shutdown() {
     moe_cache * mc = g_cache;
     if (!mc) {

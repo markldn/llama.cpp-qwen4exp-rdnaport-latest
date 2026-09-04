@@ -27,6 +27,26 @@ struct llama_ubatch {
         return n_pos >= 3;
     }
 
+    // True for a genuine prompt-processing chunk of more than one token per sequence, as
+    // opposed to a speculative-decode verify batch (also n_seq_tokens > 1, one sequence,
+    // multiple positions) or an embeddings batch: a real prefill chunk needs output/logits
+    // for at most its last token per sequence (llama_context::process_ubatch only marks the
+    // very last token of the whole prompt), while a verify batch needs output for every
+    // drafted position to check accept/reject, and an embeddings batch needs it for every
+    // token by design. See llama-moe-dynamic-k.h for why this distinction matters there.
+    bool is_real_prefill() const {
+        if (n_seq_tokens <= 1) {
+            return false;
+        }
+        uint32_t n_out = 0;
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            if (output && output[i]) {
+                ++n_out;
+            }
+        }
+        return n_out <= n_seqs;
+    }
+
     uint32_t b_equal_seqs; // note: this is a boolean, but we use an int32_t for alignment
                            //       otherwise address sanitizer complains
     // TODO: whole_seqs for embeddings?

@@ -4,6 +4,7 @@
 #include "llama-model.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
+#include "llama-moe-dynamic-k.h"
 #include "llama-sampler.h"
 
 #include "llama-kv-cache.h"
@@ -1451,6 +1452,50 @@ void llm_graph_result::set_params(const llm_graph_params & params) {
 // llm_graph_context
 //
 
+// n_expert_used for this graph build. During warmup, every expert must be touched, so it's
+// forced to n_expert regardless of any override below.
+//
+// Outside warmup: a genuine prompt-processing chunk (ubatch.is_real_prefill(), see
+// llama-batch.h) gets the prefill override -- this deliberately excludes both ordinary decode
+// (one token per sequence) AND a speculative-decode verify batch, which also spans multiple
+// positions of one sequence but needs every position's logits, unlike a real prefill chunk.
+// Without that exclusion the prefill override would silently degrade every verify step's
+// expert routing too (i.e. most of a spec-decode session, not just the prompt) rather than
+// only prompt encoding. Prefill ubatches use, in order: the adaptive tracker's suggestion (if
+// cparams.n_expert_used_adaptive is set -- see llama-moe-dynamic-k.h; llama_context::
+// process_ubatch primes the tracker with whether the *current* ubatch is real prefill before
+// this runs, since a graph rebuild -- and so this function -- doesn't happen on every ubatch
+// (a reused graph skips it entirely), but the tracker's eval callback still fires every
+// compute), else the static --n-expert-used-prefill override, else the model's own
+// n_expert_used.
+//
+// Every non-prefill ubatch (ordinary decode AND verify batches alike) instead gets the
+// separate --n-expert-used-decode override, or the model's own n_expert_used if that is unset.
+// There is deliberately no adaptive/confidence-based variant of the decode override yet --
+// only the static one.
+static uint32_t llm_graph_moe_n_expert_used(const llm_graph_params & params) {
+    const llama_hparams  & hparams = params.hparams;
+    const llama_cparams  & cparams = params.cparams;
+
+    if (cparams.warmup) {
+        return hparams.n_expert;
+    }
+
+    if (!params.ubatch.is_real_prefill()) {
+        return cparams.n_expert_used_decode > 0 ?
+            (uint32_t) cparams.n_expert_used_decode : hparams.n_expert_used;
+    }
+
+    const uint32_t k_static = cparams.n_expert_used_prefill > 0 ?
+        (uint32_t) cparams.n_expert_used_prefill : hparams.n_expert_used;
+
+    if (cparams.moe_dynamic_k && cparams.n_expert_used_adaptive) {
+        return cparams.moe_dynamic_k->suggest_k(k_static);
+    }
+
+    return k_static;
+}
+
 llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     arch             (params.arch),
     hparams          (params.hparams),
@@ -1468,7 +1513,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     n_embd_head_v    (hparams.n_embd_head_v()),
     n_embd_v_gqa     (hparams.n_embd_v_gqa()),
     n_expert         (hparams.n_expert),
-    n_expert_used    (cparams.warmup ? hparams.n_expert : hparams.n_expert_used),
+    n_expert_used    (llm_graph_moe_n_expert_used(params)),
     freq_base        (cparams.rope_freq_base),
     freq_scale       (cparams.rope_freq_scale),
     ext_factor       (cparams.yarn_ext_factor),
@@ -2391,25 +2436,31 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     assert(n_expert_used > 0);
 
     // order the views before the adds
-    for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
+    // note: during warmup n_expert_used (the parameter above) is inflated to n_expert so every
+    // expert gets touched; hparams.n_expert_used gives the real count to bound the graph to
+    // instead (ref: https://github.com/ggml-org/llama.cpp/pull/14753). Outside warmup,
+    // n_expert_used is already the real count that selected_experts/weights were built with
+    // above -- possibly overridden by --n-expert-used-prefill or --n-expert-used-decode
+    // depending on the ubatch kind -- so use it directly rather than re-deriving
+    // hparams.n_expert_used, which would mismatch under either override.
+    const uint32_t n_expert_used_agg = cparams.warmup ? hparams.n_expert_used : (uint32_t) n_expert_used;
+
+    for (uint32_t i = 0; i < n_expert_used_agg; ++i) {
         cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
 
         ggml_build_forward_expand(gf, cur_experts[i]);
     }
 
     // aggregate experts
-    // note: here we explicitly use hparams.n_expert_used instead of n_expert_used
-    //       to avoid potentially a large number of add nodes during warmup
-    //       ref: https://github.com/ggml-org/llama.cpp/pull/14753
     ggml_tensor * moe_out = cur_experts[0];
 
-    for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
+    for (uint32_t i = 1; i < n_expert_used_agg; ++i) {
         moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
 
         ggml_build_forward_expand(gf, moe_out);
     }
 
-    if (hparams.n_expert_used == 1) {
+    if (n_expert_used_agg == 1) {
         // avoid returning a non-contiguous tensor
         moe_out = ggml_cont(ctx0, moe_out);
     }

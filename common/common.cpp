@@ -1729,6 +1729,14 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_threads         = params.cpuparams.n_threads;
     cparams.n_threads_batch   = params.cpuparams_batch.n_threads == -1 ?
                                 params.cpuparams.n_threads : params.cpuparams_batch.n_threads;
+    cparams.n_expert_used_prefill          = params.n_expert_used_prefill;
+    cparams.n_expert_used_decode           = params.n_expert_used_decode;
+    cparams.n_expert_used_adaptive         = params.n_expert_used_adaptive;
+    cparams.n_expert_used_adaptive_log     = params.n_expert_used_adaptive_log;
+    cparams.n_expert_used_adaptive_layer   = params.n_expert_used_adaptive_layer;
+    cparams.n_expert_used_adaptive_k_min   = params.n_expert_used_adaptive_k_min;
+    cparams.n_expert_used_adaptive_conf_low  = params.n_expert_used_adaptive_conf_low;
+    cparams.n_expert_used_adaptive_conf_high = params.n_expert_used_adaptive_conf_high;
     cparams.embeddings        = params.embedding;
     cparams.rope_scaling_type = params.rope_scaling_type;
     cparams.rope_freq_base    = params.rope_freq_base;

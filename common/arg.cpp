@@ -2788,6 +2788,94 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
+        {"--n-expert-used-prefill"}, "N",
+        "override the number of active MoE experts (n_expert_used) for real prompt-processing "
+        "ubatches only -- decode, AND any speculative-decode (draft-mtp/ngram) verify batch, "
+        "keep using the model's own n_expert_used, since a verify batch has the same "
+        "multi-token shape as prefill but needs every position's logits instead of just the "
+        "last one. Lets prefill trade router precision for speed since it is compute- not "
+        "memory-bound; the model was not trained for this value so verify output quality "
+        "before relying on it. 0 = disabled, default",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.n_expert_used_prefill = value;
+        }
+    ).set_env("LLAMA_ARG_N_EXPERT_USED_PREFILL"));
+    add_opt(common_arg(
+        {"--n-expert-used-decode"}, "N",
+        "override the number of active MoE experts (n_expert_used) for every non-prefill "
+        "ubatch -- ordinary one-token decode AND any speculative-decode (draft-mtp/ngram) "
+        "verify batch. Independent of --n-expert-used-prefill. Unlike the prefill override "
+        "(compute-bound, cheap to trade router precision for speed), decode is typically "
+        "memory-bandwidth-bound, so this changes what every generated token actually computes, "
+        "not just prompt encoding -- the model was not trained at a reduced K here either. "
+        "0 = disabled, default (model's own n_expert_used, unchanged)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.n_expert_used_decode = value;
+        }
+    ).set_env("LLAMA_ARG_N_EXPERT_USED_DECODE"));
+    add_opt(common_arg(
+        {"--n-expert-used-adaptive"},
+        "derive n_expert_used-prefill from the real router confidence observed on the "
+        "previous prefill ubatch instead of a fixed value (overrides --n-expert-used-prefill "
+        "from the second prefill ubatch of a run onward; the first one still uses it, or the "
+        "model default if unset). Tune with --n-expert-used-adaptive-k-min/-conf-low/-conf-high; "
+        "check --n-expert-used-adaptive-log first to see what it would pick before enabling.",
+        [](common_params & params) {
+            params.n_expert_used_adaptive = true;
+        }
+    ).set_env("LLAMA_ARG_N_EXPERT_USED_ADAPTIVE"));
+    add_opt(common_arg(
+        {"--n-expert-used-adaptive-log"},
+        "log the router confidence and suggested n_expert_used for every prefill ubatch, "
+        "regardless of whether --n-expert-used-adaptive is applying it -- use this to "
+        "calibrate the thresholds below against real prompts first. Needs --verbosity 2 "
+        "(or higher) to actually show; it's logged at warning level",
+        [](common_params & params) {
+            params.n_expert_used_adaptive_log = true;
+        }
+    ).set_env("LLAMA_ARG_N_EXPERT_USED_ADAPTIVE_LOG"));
+    add_opt(common_arg(
+        {"--n-expert-used-adaptive-layer"}, "N",
+        "router layer whose confidence drives --n-expert-used-adaptive (default: -1, auto = "
+        "n_layer / 2)",
+        [](common_params & params, int value) {
+            params.n_expert_used_adaptive_layer = value;
+        }
+    ).set_env("LLAMA_ARG_N_EXPERT_USED_ADAPTIVE_LAYER"));
+    add_opt(common_arg(
+        {"--n-expert-used-adaptive-k-min"}, "N",
+        string_format("n_expert_used to use at --n-expert-used-adaptive-conf-high (default: %d)",
+        params.n_expert_used_adaptive_k_min),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.n_expert_used_adaptive_k_min = value;
+        }
+    ).set_env("LLAMA_ARG_N_EXPERT_USED_ADAPTIVE_K_MIN"));
+    add_opt(common_arg(
+        {"--n-expert-used-adaptive-conf-low"}, "F",
+        string_format("router confidence at or below which --n-expert-used-adaptive keeps the "
+        "model's full n_expert_used (default: %.2f)", params.n_expert_used_adaptive_conf_low),
+        [](common_params & params, const std::string & value) {
+            params.n_expert_used_adaptive_conf_low = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_N_EXPERT_USED_ADAPTIVE_CONF_LOW"));
+    add_opt(common_arg(
+        {"--n-expert-used-adaptive-conf-high"}, "F",
+        string_format("router confidence at or above which --n-expert-used-adaptive drops to "
+        "-k-min (default: %.2f)", params.n_expert_used_adaptive_conf_high),
+        [](common_params & params, const std::string & value) {
+            params.n_expert_used_adaptive_conf_high = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_N_EXPERT_USED_ADAPTIVE_CONF_HIGH"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

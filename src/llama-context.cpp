@@ -111,6 +111,22 @@ llama_context::llama_context(
 
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
+    cparams.n_expert_used_prefill   = params.n_expert_used_prefill;
+    cparams.n_expert_used_decode    = params.n_expert_used_decode;
+    cparams.n_expert_used_adaptive  = params.n_expert_used_adaptive;
+
+    if (params.n_expert_used_adaptive || params.n_expert_used_adaptive_log) {
+        moe_dyn_k = std::make_unique<llama_moe_dynamic_k>(
+            hparams.n_layer(),
+            hparams.n_expert_used,
+            params.n_expert_used_adaptive_layer,
+            std::max(1, params.n_expert_used_adaptive_k_min),
+            params.n_expert_used_adaptive_conf_low,
+            params.n_expert_used_adaptive_conf_high,
+            params.n_expert_used_adaptive_log);
+        cparams.moe_dynamic_k = moe_dyn_k.get();
+    }
+
     cparams.yarn_ext_factor         = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
     cparams.yarn_attn_factor        = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
     cparams.yarn_beta_fast          = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
@@ -1376,6 +1392,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    if (moe_dyn_k) {
+        // refresh on every ubatch, reused graph or not: a reused graph keeps the eval
+        // callback installed from whenever it was last built, so this can't be left to the
+        // (build-only) n_expert_used computation in llama-graph.cpp or it goes stale across
+        // reused decode steps and misclassifies them as prefill. See llama-moe-dynamic-k.h.
+        // is_real_prefill() (llama-batch.h) also excludes speculative-decode verify batches,
+        // which have the same n_seq_tokens > 1 shape as real prefill but need every position's
+        // logits instead of just the last one.
+        moe_dyn_k->begin_ubatch(!cparams.warmup && ubatch.is_real_prefill());
+    }
+
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
@@ -1391,7 +1418,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        if (moe_dyn_k) {
+            // chain the caller's own cb_eval (if any) behind ours, so it still fires for
+            // tensors we're not watching; see llama-moe-dynamic-k.h
+            moe_dyn_k->set_chain(cparams.cb_eval, cparams.cb_eval_user_data);
+            ggml_backend_sched_set_eval_callback(sched.get(), llama_moe_dynamic_k::eval_cb, moe_dyn_k.get());
+        } else {
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        }
 
         //const auto t_start_us = ggml_time_us();
 
@@ -2541,7 +2575,11 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    // see llama-moe-expert-cache.h: the cache's worker thread submits/syncs
+    // through its own backend/stream on the same device this call uses.
+    llama_moe_cache_gpu_lock();
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    llama_moe_cache_gpu_unlock();
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
@@ -3567,6 +3605,12 @@ llama_context_params llama_context_default_params() {
         /*.n_outputs_max_per_seq       =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
+        /*.n_expert_used_prefill       =*/ 0,
+        /*.n_expert_used_decode        =*/ 0,
+        /*.n_expert_used_adaptive_layer=*/ -1,
+        /*.n_expert_used_adaptive_k_min=*/ 4,
+        /*.n_expert_used_adaptive_conf_low  =*/ 0.2f,
+        /*.n_expert_used_adaptive_conf_high =*/ 0.5f,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,
@@ -3594,6 +3638,8 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.n_expert_used_adaptive      =*/ false,
+        /*.n_expert_used_adaptive_log  =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

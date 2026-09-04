@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-moe-dynamic-k.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -329,6 +330,10 @@ private:
 
     // reuse the batch_allocr to avoid unnecessary memory allocations
     std::unique_ptr<llama_batch_allocr> balloc;
+
+    // confidence-based dynamic K for prefill; null unless n_expert_used_adaptive[_log] was
+    // requested. See llama-moe-dynamic-k.h; cparams.moe_dynamic_k points at this.
+    std::unique_ptr<llama_moe_dynamic_k> moe_dyn_k;
 
     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
 

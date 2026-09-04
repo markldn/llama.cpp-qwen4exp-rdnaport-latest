@@ -99,6 +99,21 @@ const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * up_exps
 // while a graph referencing the cache tensors/tables may still be running.
 void llama_moe_cache_step();
 
+// Hold this around any HIP/HSA call the caller issues directly against a
+// device the cache also has a backend/stream open on (i.e. around
+// llama_context::graph_compute's ggml_backend_sched_graph_compute_async
+// call). The cache's own worker thread uploads and synchronizes through its
+// own independent ggml_backend_t for that device; ROCm's HSA runtime isn't
+// safe for two host threads to submit/sync concurrently through separate
+// backend/stream objects on the same physical device -- observed as either a
+// crash (see README, the n-max=4 ggml-cuda/mmq.cu bug) or, worse, the
+// consumer-side wait hanging forever with no error at all. No-op when the
+// cache is disabled. Cheap to call unconditionally: the lock is only held
+// for the duration of one graph_compute call, and the worker's own critical
+// section under it is a small throttled batch (max_inserts/layer/step).
+void llama_moe_cache_gpu_lock();
+void llama_moe_cache_gpu_unlock();
+
 // Stops the upload worker thread and frees cache resources. Call once at
 // process/context teardown if a clean shutdown matters (tests, embedding
 // this in a longer-lived host process); the OS reclaims everything on exit

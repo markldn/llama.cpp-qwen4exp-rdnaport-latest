@@ -367,6 +367,30 @@ extern "C" {
         int32_t  n_threads;             // number of threads to use for generation
         int32_t  n_threads_batch;       // number of threads to use for batch processing
 
+        // override n_expert_used for prefill ubatches (n_seq_tokens > 1), independent of the
+        // value used for decode; 0 = disabled, use the model's own n_expert_used for everything.
+        // Also the K used for the first prefill ubatch of a run when n_expert_used_adaptive is
+        // set, since there's nothing observed yet to derive a K from at that point.
+        int32_t  n_expert_used_prefill;
+
+        // override n_expert_used for every non-prefill ubatch (ordinary one-token decode AND
+        // speculative-decode verify batches), independent of n_expert_used_prefill;
+        // 0 = disabled, use the model's own n_expert_used. The model was not trained at a
+        // reduced K, so this changes what every generated token actually computes -- verify
+        // output quality before relying on it for anything that matters.
+        int32_t  n_expert_used_decode;
+
+        // confidence-based dynamic K for prefill: observes the real router softmax of one
+        // layer (n_expert_used_adaptive_layer, < 0 = auto/n_layer/2) each prefill ubatch and
+        // derives a suggested n_expert_used for the *next* prefill ubatch from it -- low
+        // confidence keeps the model's own n_expert_used, high confidence uses
+        // n_expert_used_adaptive_k_min, in between is linearly interpolated. See
+        // llama-moe-dynamic-k.h for why this always lags one ubatch behind.
+        int32_t  n_expert_used_adaptive_layer;    // < 0 = auto (n_layer / 2)
+        int32_t  n_expert_used_adaptive_k_min;    // K to use at n_expert_used_adaptive_conf_high
+        float    n_expert_used_adaptive_conf_low;  // confidence <= this -> full n_expert_used
+        float    n_expert_used_adaptive_conf_high; // confidence >= this -> n_expert_used_adaptive_k_min
+
         enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
         enum llama_pooling_type      pooling_type;      // whether to pool (sum) embedding results by sequence id
@@ -416,6 +440,8 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool n_expert_used_adaptive;     // apply the confidence-based suggested K to prefill ubatches
+        bool n_expert_used_adaptive_log; // log the confidence/suggested K every prefill ubatch, regardless of the above
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
