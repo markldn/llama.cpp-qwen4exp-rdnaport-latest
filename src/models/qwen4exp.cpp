@@ -393,7 +393,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     // the inject product - into one dispatch; the model views the mixed and
     // inject outputs out of the one result. The prefill path keeps the
     // unfused chain so its numerics (mmq vs mmvq accumulation) are untouched.
-    if (nt == 1 && cparams.fused_hc_mix) {
+    // ggml_hc_mix only implements the Q8_0 dequant path; models/heads whose
+    // hc_down/hc_up weights are quantized differently (e.g. the MTP draft
+    // head, which ships as Q4_K_M) must take the unfused chain below instead.
+    if (nt == 1 && cparams.fused_hc_mix && w_down->type == GGML_TYPE_Q8_0 && w_up->type == GGML_TYPE_Q8_0) {
         // w_inject == nullptr only for the head call (il = -1): no tail
         ggml_tensor * dst_t = ggml_hc_mix(ctx0, x, w_norm, w_down, w_up, w_inject,
                 hc, hparams.f_norm_rms_eps);
