@@ -640,6 +640,7 @@ static __global__ void mul_mat_vec_q(
     [[maybe_unused]] const float * conv_states = nullptr;
     [[maybe_unused]] int conv_kernel_size = 0;
     ggml_glu_op active_glu;
+    float glu_limit = 0.0f;
 
     if constexpr (has_fusion) {
         use_gate      = fusion.gate      != nullptr;
@@ -649,6 +650,239 @@ static __global__ void mul_mat_vec_q(
         x_bias        = (const float *) fusion.x_bias;
         gate_bias     = (const float *) fusion.gate_bias;
         active_glu    = fusion.glu_op;
+        glu_limit     = fusion.glu_limit;
+        use_dst_gate  = fusion.dst_gate != nullptr && use_gate;
+        if (use_dst_gate) {
+            dst_gate = fusion.dst_gate;
+        }
+        use_conv_input = fusion.conv_input != nullptr && fusion.conv_states != nullptr;
+        if (use_conv_input) {
+            conv_input       = (float *) fusion.conv_input;
+            conv_states      = (const float *) fusion.conv_states;
+            conv_kernel_size = fusion.conv_kernel_size;
+        }
+        if constexpr (type == GGML_TYPE_NVFP4) {
+            use_scale      = fusion.x_scale    != nullptr;
+            use_gate_scale = fusion.gate_scale != nullptr && use_gate;
+            x_scale        = (const float *) fusion.x_scale;
+            gate_scale     = (const float *) fusion.gate_scale;
+        }
+        // Per-token scale (MoE down x topk weights). Indexed by channel_dst.
+        if (fusion.x_scale_channel_dst) {
+            use_scale = true;
+            x_scale   = (const float *) fusion.x_scale;
+        }
+    }
+
+
+    [[maybe_unused]] float x_biases[ncols_dst]    = { 0.0f };
+    [[maybe_unused]] float gate_biases[ncols_dst] = { 0.0f };
+    [[maybe_unused]] float x_scales = 1.0f;
+    [[maybe_unused]] float gate_scales = 1.0f;
+    if constexpr (has_fusion) {
+        // 1. Hide latency by prefetching bias, gates and scales here
+        // 2. load only on threads that won't die after partial sum calculation
+        const uint32_t channel_bias = ids ? channel_x : channel_dst;
+        if (threadIdx.x < rows_per_cuda_block && threadIdx.y == 0 &&
+            (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
+            if (use_bias) {
+                x_bias = x_bias + sample_dst * stride_sample_dst + channel_bias * stride_channel_dst + row0;
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    x_biases[j] = x_bias[j * stride_col_dst + threadIdx.x];
+                }
+            }
+            if (use_gate_bias) {
+                gate_bias = gate_bias + sample_dst * stride_sample_dst + channel_bias * stride_channel_dst + row0;
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    gate_biases[j] = gate_bias[j * stride_col_dst + threadIdx.x];
+                }
+            }
+            if (use_scale) {
+                x_scales = fusion.x_scale_channel_dst ? x_scale[channel_dst] : x_scale[ids ? channel_x : 0];
+            }
+            if (use_gate_scale) {
+                gate_scales = gate_scale[ids ? channel_x : 0];
+            }
+        }
+    }
+
+    // partial sum for each thread
+    float tmp[ncols_dst][rows_per_cuda_block] = {{0.0f}};
+    float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}};
+
+    const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
+    const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
+
+    // split (token, row, kblock) items across the thread groups: the plain K-split
+    // loop leaves most groups idle on short-K decode GEMMs (MoE down K=512, router
+    // K=2048, qkv K=8192), wasting ~3/4 of the issue slots on RDNA4
+    const int n_items  = ncols_dst * rows_per_cuda_block * blocks_per_row_x;
+    const int n_groups = nwarps * warp_size / (qi/vdr);
+    const int kqs      = vdr * (tid % (qi/vdr)); // x block quant index when casting the quants to int
+    for (int it = tid / (qi/vdr); it < n_items; it += n_groups) {
+        const int j   = it / (rows_per_cuda_block * blocks_per_row_x);
+        const int rem = it % (rows_per_cuda_block * blocks_per_row_x);
+        const int i   = rem / blocks_per_row_x;
+        const int kbx = rem % blocks_per_row_x;
+
+        const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
+
+        tmp[j][i] += vec_dot_q_cuda(
+            vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+        if constexpr (has_fusion) {
+            if (use_gate) {
+                tmp_gate[j][i] += vec_dot_q_cuda(
+                    vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+            }
+        }
+    }
+
+    // cross-warp combine: each warp reduces its own lanes first (deterministic
+    // tree), then one value per warp is summed serially by warp 0. The shared
+    // footprint no longer scales with ncols_dst x rows_per_block, which lets the
+    // short-K rows_per_block override fill the thread groups at any batch size.
+    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block];
+    [[maybe_unused]] __shared__ float tmp_shared_gate[(has_fusion && (nwarps-1 > 0)) ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block];
+
+    {
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        tmp_gate[j][i] = warp_reduce_sum<warp_size>(tmp_gate[j][i]);
+                    }
+                }
+                if (threadIdx.y > 0) {
+                    tmp_shared[threadIdx.y-1][j][i] = tmp[j][i];
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            tmp_shared_gate[threadIdx.y-1][j][i] = tmp_gate[j][i];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) {
+        return;
+    }
+
+    dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
+
+    // sum up partial sums and write back result
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+        for (int i = 0; i < rows_per_cuda_block; ++i) {
+#pragma unroll
+            for (int l = 0; l < nwarps-1; ++l) {
+                tmp[j][i] += tmp_shared[l][j][i];
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        tmp_gate[j][i] += tmp_shared_gate[l][j][i];
+                    }
+                }
+            }
+
+            float result_val = 0.0f;
+            if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
+                result_val = tmp[j][i];
+                if constexpr (has_fusion) {
+                    if (use_scale) {
+                        result_val *= x_scales;
+                    }
+                    result_val += x_biases[j];
+                    if (use_gate) {
+                        float gate_value = tmp_gate[j][i];
+                        if constexpr (type == GGML_TYPE_NVFP4) {
+                            gate_value *= gate_scales;
+                        }
+                        gate_value += gate_biases[j];
+                        if (use_dst_gate) {
+                            // separate output: write the gate result to its own destination
+                            // (dst was already offset by sample/channel/row; apply the same to dst_gate)
+                            float * dst_gate_row = (float *) dst_gate + sample_dst*stride_sample_dst +
+                                                   channel_dst*stride_channel_dst + row0 + j*stride_col_dst;
+                            dst_gate_row[i] = gate_value;
+                        } else {
+                            switch (active_glu) {
+                                case GGML_GLU_OP_SWIGLU:
+                                    result_val *= ggml_cuda_op_silu_single(gate_value);
+                                    break;
+                                case GGML_GLU_OP_GEGLU:
+                                    result_val *= ggml_cuda_op_gelu_single(gate_value);
+                                    break;
+                                case GGML_GLU_OP_SWIGLU_OAI:
+                                    result_val = ggml_cuda_op_swiglu_oai_single(gate_value, result_val);
+                                    break;
+                                case GGML_GLU_OP_SWIGLU_CLAMP:
+                                    result_val = ggml_cuda_op_swiglu_clamp_single(gate_value, result_val, glu_limit);
+                                    break;
+                                default:
+                                    result_val = result_val * gate_value;
+                                    break;
+                            }
+                        }
+                    }
+                }
+            }
+            if (use_conv_input) {
+                // interleaved conv input: [state0, state1, ..., state_{cs-2}, result] per
+                // channel. conv_input [cs, C] has nb1 = cs floats, conv_states [(cs-1), C]
+                // has nb1 = cs-1 floats. Spread the 4 writes over threads 0..cs-1.
+                const float r_bcast = __shfl_sync(0xffffffff, result_val, i, warp_size);
+                const int c = row0 + i;
+                const int cs = conv_kernel_size;
+                if (threadIdx.x < cs) {
+                    const int k = threadIdx.x;
+                    const float v = k < cs - 1 ? conv_states[(cs-1)*c + k] : r_bcast;
+                    conv_input[cs*c + k] = v;
+                }
+            } else if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
+                dst[j*stride_col_dst + i] = result_val;
+            }
+        }
+    }
+
+    if constexpr (!has_fusion) {
+        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, use_dst_gate, use_conv_input, active_glu, glu_limit, gate_bias, x_bias, x_scale, gate_scale, tmp_gate, dst_gate, conv_input, conv_states, conv_kernel_size);
+    }
+    if constexpr (type != GGML_TYPE_NVFP4) {
+        GGML_UNUSED_VARS(use_scale, use_gate_scale, x_scale, gate_scale, x_scales, gate_scales);
+    }
+}
+
+// Dedicated MoE multi-token kernel.
+// Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
+// Block: (warp_size, ncols_dst) - each warp handles one token independently.
+// No shared memory reduction needed since each warp works alone.
+template <ggml_type type, int c_rows_per_block, bool has_fusion = false>
+__launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_moe(
+        const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
+        float * dst_ptr,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
+        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+        const uint32_t ncols_dst, const uint32_t ids_stride, const uint32_t nchannels_dst) {
+    const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
+    const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
+    const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
+    float         * GGML_CUDA_RESTRICT dst = dst_ptr;
+
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+
     // fuse gate, bias, scales, and glu_op into the up projection
     bool use_gate = false;
     const void  * vgate      = nullptr;
@@ -696,6 +930,7 @@ static __global__ void mul_mat_vec_q(
 
     // partial sum for each thread
     float tmp[c_rows_per_block] = {0.0f};
+    float tmp_gate[c_rows_per_block] = {0.0f};
 
     // split (row, kblock) items across the 8 thread groups: the K-split loop
     // leaves most groups idle on short-K MoE GEMMs (down K=512 -> 2 K-blocks)
@@ -720,6 +955,11 @@ static __global__ void mul_mat_vec_q(
 #pragma unroll
     for (int i = 0; i < c_rows_per_block; ++i) {
         tmp[i] = warp_reduce_sum<warp_size>(tmp[i]);
+        if constexpr (has_fusion) {
+            if (use_gate) {
+                tmp_gate[i] = warp_reduce_sum<warp_size>(tmp_gate[i]);
+            }
+        }
     }
 
     // Write results
@@ -777,6 +1017,7 @@ static __global__ void mul_mat_vec_q(
         GGML_UNUSED_VARS(x_scale, gate_scale);
     }
 }
+
 
 template<ggml_type type>
 static std::pair<dim3, dim3> calc_launch_params(

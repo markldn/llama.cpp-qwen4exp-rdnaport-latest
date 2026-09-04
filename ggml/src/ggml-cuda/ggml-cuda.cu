@@ -4098,6 +4098,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                                       src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q8_0 ||
                                       src0->type == GGML_TYPE_Q6_K;
             if (op == GGML_OP_MUL_MAT_ID && ids != nullptr && !disable_moe_mmq && GGML_CUDA_CC_IS_RDNA4(cc) && moe_mmq_type &&
+                    src1->ne[2] > MMVQ_MAX_BATCH_SIZE &&
                     ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
