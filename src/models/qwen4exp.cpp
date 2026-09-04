@@ -867,33 +867,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
-    ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
-
-    // decode fast path: gather the selected K/V rows and attend over n_sel cells
-    {
-        const int64_t n_kv  = k->ne[2];
-        const int64_t r     = hparams.dsv4_compress_ratios[il];
-        const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
-
-        // build_qsa_top_k took the same decision, so top_k already has n_sel entries
-        const int64_t n_sel = qsa_gather_n_sel(n_kv, width);
-        if (n_sel > 0) {
-            GGML_ASSERT(top_k->ne[0] == n_sel);
-
-            ggml_tensor * cur = build_attn_qsa_gather(k, v, kq_mask, q_cur, top_k, width, kq_scale, il);
-            cb(cur, "kqv_out", il);
-
-            // the rotation is its own inverse, so undo it on the value side of the output
-            if (inp->self_v_rot) {
-                cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
-            }
-
-            return cur;
-        }
-    }
-
     // prepare new kq mask - starts filled with -INFINITY
     ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
 
