@@ -154,21 +154,28 @@ through the wrong kernel.
 ## Benchmarks
 
 Dual-GPU box: AMD Radeon AI PRO R9700 32GB (gfx1201, `main-gpu`) + AMD Radeon RX 9070 16GB
-(gfx1201, on a 4-lane PCIe 3.0 link), Qwen3.8-Flash-Next UD-Q4_K_XL, `--ctx-size 262144`,
-`--tensor-split 87,13`, `--n-cpu-moe 40`. Figures are pooled averages across multiple trials
-of three varied prompts each; run-to-run noise on this box is real (~2-2.5 t/s band) — treat
-any single number as ± that, not exact.
+(gfx1201, on a 4-lane PCIe 3.0 link), Qwen3.8-Flash-Next UD-Q4_K_XL, `--tensor-split 87,13`,
+`--n-cpu-moe 40`.
 
-| Config | Speed |
-|---|---|
-| Cache disabled | 10.9 t/s |
-| Cache enabled | ~20.8 t/s |
-| Cache + RDNA-boosts (stage-1+stage-2) | ~21.24 t/s decode / 299.1 t/s prefill |
+The cache-only rows below isolate the cache's contribution with everything else fixed
+(no MTP, no RDNA-boosts): single trial each, one real ~8000-token llama.cpp source-code
+prompt, `--ctx-size 32768`, greedy (`temp 0`), 200 tokens generated, cache row measured
+after a warm-up pass (a cold cache understates its steady-state benefit). Treat single-trial
+numbers as noisier than the multi-trial production figure below it, which uses a different,
+larger `--ctx-size 262144` config and isn't directly comparable to these two rows:
 
-The first two rows isolate the cache's own contribution (**+57%**); the RDNA-boosts row
-above is a further +6.4% decode / +18.0% prefill on top of that, measured against the
-cache+MTP baseline (see RDNA-boosts port). A few other things measured along the way, all
-reflected in the flags below:
+| Config | Decode | Prefill |
+|---|---|---|
+| Cache + MTP disabled | 12.2 t/s | 207.0 t/s |
+| Cache enabled (MTP still disabled) | 15.1 t/s | 254.1 t/s |
+| Cache + MTP + RDNA-boosts (production config, `--ctx-size 262144`, 5-trial pooled avg) | 21.24 t/s | 299.1 t/s |
+
+The cache alone is good for **+24% decode / +23% prefill** here, consistent with the +23%
+decode figure quoted elsewhere in this fork's tuning notes for the same isolated
+no-cache/no-MTP comparison. The third row is a separate, larger-scale measurement with MTP
+and RDNA-boosts also enabled — its own +6.4% decode / +18.0% prefill delta (see RDNA-boosts
+port) is against a cache+MTP baseline, not against row 1 or 2 above. A few other things
+measured along the way, all reflected in the flags below:
 
 - `HSA_ENABLE_SDMA=1` (not `=0`) — re-enables ROCm's dedicated copy engines for cross-device
   traffic. Measured **+8.9%** on this dual-GPU box; the *opposite* direction on a single-GPU
