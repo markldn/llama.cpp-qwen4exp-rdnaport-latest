@@ -1674,6 +1674,7 @@ struct ggml_cuda_mm_fusion_args_host {
     // (expert). Used for the MoE down x topk-weights fusion.
     bool x_scale_channel_dst = false;
     ggml_glu_op glu_op;
+    float glu_limit = 0.0f;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1687,6 +1688,7 @@ struct ggml_cuda_mm_fusion_args_device {
     int conv_kernel_size = 0;
     bool x_scale_channel_dst = false;
     ggml_glu_op glu_op;
+    float glu_limit = 0.0f;
 };
 
 struct ggml_cuda_kernel_launch_params {
