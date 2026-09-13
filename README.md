@@ -1,4 +1,12 @@
-# llama.cpp - qwen4exp + MTP + RDNA-boosts + LRU expert cache + Speculative Prefill
+# llama.cpp - qwen4exp + MTP + RDNA-boosts + LRU expert cache + Speculative Prefill (latest)
+
+**This is the current production build** - merged onto upstream `llama.cpp` `master` (not
+sitting 2 weeks behind it), with two post-merge bugs found and fixed, and one upstream
+kernel-fusion regression removed. It supersedes
+[llama.cpp-qwen4exp-specprefill](https://github.com/markldn/llama.cpp-qwen4exp-specprefill),
+the pre-merge state this fork was branched from - see "Base" below for exactly what changed
+between the two and why. Use this repo unless you have a specific reason to want the older,
+pre-merge snapshot.
 
 The fastest configuration measured so far on dual RDNA4 (gfx1201) hardware for
 **Qwen3.8-Flash-Next**. A fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
@@ -48,10 +56,8 @@ binary, same config, different process starts can diverge slightly; each run is 
 deterministic, just not bit-identical across restarts) - so correctness here is judged by
 coherent/correct output and needle-in-haystack retrieval, not byte-for-byte diffing.
 
-This repo is published as a squashed snapshot (one commit, no incremental history) rather
-than the full commit-by-commit history against that base - `git log` here won't show
-upstream's history or the intermediate steps that produced this fork. The code is the real,
-built-and-measured artifact either way; only the trail of how it was written is missing.
+This repo is published with full commit-by-commit history (`git log` shows upstream's
+history and every intermediate step that produced this fork), not a squashed snapshot.
 
 ## What's different from upstream
 
