@@ -2,11 +2,23 @@
 
 The fastest configuration measured so far on dual RDNA4 (gfx1201) hardware for
 **Qwen3.8-Flash-Next**. A fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
-that adds native MTP (multi-token prediction) speculative decoding for Qwen3.8-Flash-Next
-(Alibaba's `qwen4exp` MoE architecture), an asynchronous, device-side GPU-resident LRU cache
-for CPU-offloaded MoE expert weights, a set of RDNA4 (AMD gfx1201) kernel-level speed boosts,
-and a port of upstream's not-yet-merged Speculative Prefill (prompt-chunk trimming for
-faster TTFT) - see below for what each buys you and the numbers behind it.
+that wires Qwen3.8-Flash-Next's own NextN/MTP draft head (Alibaba's `qwen4exp` MoE
+architecture) into upstream's existing multi-token-prediction speculative decoding
+framework, adds an asynchronous, device-side GPU-resident LRU cache for CPU-offloaded MoE
+expert weights, a set of RDNA4 (AMD gfx1201) kernel-level speed boosts, and a port of
+upstream's not-yet-merged Speculative Prefill (prompt-chunk trimming for faster TTFT) - see
+below for what each buys you and the numbers behind it.
+
+**Note on MTP**: multi-token-prediction speculative decoding itself is a well-established
+upstream `llama.cpp` feature (GLM, DeepSeek, StepFun, Gemma4 and others have had native MTP
+support for a while, via a long history of upstream PRs). This fork did not invent MTP.
+What upstream's `qwen4exp` merge ([PR #27742](https://github.com/ggml-org/llama.cpp/pull/27742))
+did *not* include is `qwen4exp`'s own NextN/MTP draft head - upstream's `qwen4exp.cpp` has
+tensors also named `hc_head_*`, but those belong to the *main* model's own output mixer, an
+unrelated architectural piece that happens to share a name; there is no `nextn` anywhere in
+upstream's `qwen4exp` code (checked directly against `origin/master` as of this writing).
+Loading a `qwen4exp` NextN/MTP draft checkpoint via `-md` needed genuinely new conversion
+and graph-building code, which is this fork's actual contribution here - see below.
 
 Base: upstream commit `88ddbf0a1` (the commit that merged `qwen4exp` architecture support,
 [PR #27742](https://github.com/ggml-org/llama.cpp/pull/27742)).
@@ -18,8 +30,10 @@ built-and-measured artifact either way; only the trail of how it was written is 
 
 ## What's different from upstream
 
-1. **MTP draft-head support** - native speculative decoding for `qwen4exp` (`nextn`/
-   `hc_head` tensors, draft-head-only GGUF loading via `-md`).
+1. **`qwen4exp` NextN/MTP draft-head wiring** - connects `qwen4exp`'s own NextN draft head
+   (`nextn.*` tensors, draft-head-only GGUF loading via `-md`) to upstream's existing MTP
+   speculative-decoding framework, which upstream's own `qwen4exp` merge didn't include -
+   see the note above.
 2. **A GPU-resident LRU expert cache** (`--moe-expert-cache-experts`) - see below.
 3. **RDNA-boosts kernel port** - a set of AMD RDNA4 kernel optimizations ([stew675/
    llama-cpp-rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts)) ported onto
