@@ -1,29 +1,34 @@
-# llama.cpp — qwen4exp + MTP + RDNA-boosts + GPU-resident LRU expert cache
+# llama.cpp - qwen4exp + MTP + RDNA-boosts + LRU expert cache + Speculative Prefill
 
-A fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) that adds native MTP
-(multi-token prediction) speculative decoding for **Qwen3.8-Flash-Next** (Alibaba's
-`qwen4exp` MoE architecture), an asynchronous, device-side GPU-resident LRU cache for
-CPU-offloaded MoE expert weights, and a set of RDNA4 (AMD gfx1201) kernel-level speed
-boosts ported on top of both.
+The fastest configuration measured so far on dual RDNA4 (gfx1201) hardware for
+**Qwen3.8-Flash-Next**. A fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
+that adds native MTP (multi-token prediction) speculative decoding for Qwen3.8-Flash-Next
+(Alibaba's `qwen4exp` MoE architecture), an asynchronous, device-side GPU-resident LRU cache
+for CPU-offloaded MoE expert weights, a set of RDNA4 (AMD gfx1201) kernel-level speed boosts,
+and a port of upstream's not-yet-merged Speculative Prefill (prompt-chunk trimming for
+faster TTFT) - see below for what each buys you and the numbers behind it.
 
 Base: upstream commit `88ddbf0a1` (the commit that merged `qwen4exp` architecture support,
 [PR #27742](https://github.com/ggml-org/llama.cpp/pull/27742)).
 
 This repo is published as a squashed snapshot (one commit, no incremental history) rather
-than the full commit-by-commit history against that base — `git log` here won't show
+than the full commit-by-commit history against that base - `git log` here won't show
 upstream's history or the intermediate steps that produced this fork. The code is the real,
 built-and-measured artifact either way; only the trail of how it was written is missing.
 
 ## What's different from upstream
 
-1. **MTP draft-head support** — native speculative decoding for `qwen4exp` (`nextn`/
+1. **MTP draft-head support** - native speculative decoding for `qwen4exp` (`nextn`/
    `hc_head` tensors, draft-head-only GGUF loading via `-md`).
-2. **A GPU-resident LRU expert cache** (`--moe-expert-cache-experts`) — see below.
-3. **RDNA-boosts kernel port** — a set of AMD RDNA4 kernel optimizations ([stew675/
+2. **A GPU-resident LRU expert cache** (`--moe-expert-cache-experts`) - see below.
+3. **RDNA-boosts kernel port** - a set of AMD RDNA4 kernel optimizations ([stew675/
    llama-cpp-rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts)) ported onto
-   this fork's `qwen4exp` code path — see below.
-4. **Experimental per-batch expert-count override** (`--n-expert-used-*`) — see below.
+   this fork's `qwen4exp` code path - see below.
+4. **Experimental per-batch expert-count override** (`--n-expert-used-*`) - see below.
    Not validated for output quality; off by default.
+5. **Speculative Prefill** (`--spec-prefill`) - a port of upstream's not-yet-merged
+   [PR #27692](https://github.com/ggml-org/llama.cpp/pull/27692) - see below. Off by
+   default; needs a separate small estimator model to enable.
 
 ## The expert cache
 
@@ -42,19 +47,19 @@ those CPU-offloaded tensors:
 
 How it works:
 
-- A cache miss this step just runs the **normal CPU path** for that expert — exactly what
+- A cache miss this step just runs the **normal CPU path** for that expert - exactly what
   would happen with the cache off, so the cache only ever removes work, never adds a stall.
   Decode never blocks waiting on a cache miss.
 - A background worker thread fills the cache **off the critical path**. The new mapping is
   only published (table swapped) once the upload actually completes, at a *later*
-  `llama_moe_cache_step()` call — a running graph can never observe a torn slot.
+  `llama_moe_cache_step()` call - a running graph can never observe a torn slot.
 - Uploads are throttled (`--moe-expert-cache-inserts` per layer per step) so a cold cache
   can't saturate the host↔GPU link.
 - Every `--n-cpu-moe`-offloaded expert weight tensor gets host-memory pinned (page-locked in
-  place, no copy) at load time — this happens whenever offloaded experts exist, independent
+  place, no copy) at load time - this happens whenever offloaded experts exist, independent
   of whether the cache above is even enabled. It speeds up both the cache's own uploads and
   `ggml-backend-sched`'s separate op-offload path (which streams these same weights to a GPU
-  for large batches like prefill, cache or no cache) — see Benchmarks.
+  for large batches like prefill, cache or no cache) - see Benchmarks.
 
 ## RDNA-boosts port
 
@@ -79,23 +84,23 @@ auto-resolution:
 Real bugs found and independently verified during the port, since a kernel-level port this
 size can silently regress correctness or performance without producing a visible error:
 
-- A silent function-signature mismatch after a merge (a dropped `fusion` parameter) — caught
+- A silent function-signature mismatch after a merge (a dropped `fusion` parameter) - caught
   by inspection before the first build.
 - A new prefill-MMQ fusion arm with no batch-size lower bound was stealing MTP's small
   (2-4 token) speculative-decode verify batches away from the fast `mul_mat_vec_q_moe`
-  kernel into a batched/prefill-oriented MMQ kernel instead — found via `rocprofv3`
+  kernel into a batched/prefill-oriented MMQ kernel instead - found via `rocprofv3`
   kernel-trace comparison against the pre-port baseline, fixed by gating the arm to
   `src1->ne[2] > MMVQ_MAX_BATCH_SIZE`.
 - A cascading merge conflict had deleted an entire kernel function (`mul_mat_vec_q_moe`)
-  from `mmvq.cu` — caught by a genuine compile error, fixed by restoring the function body
+  from `mmvq.cu` - caught by a genuine compile error, fixed by restoring the function body
   from the source commit.
 - `ggml_hc_mix()` hard-asserts Q8_0 weights but the fused call site never checked weight
   type first, so it crashed on context init the instant MTP was enabled (the MTP draft head
-  ships as Q4_K_M) — fixed by adding the missing type check; the unfused fallback path was
+  ships as Q4_K_M) - fixed by adding the missing type check; the unfused fallback path was
   already there, just unreachable.
 - An out-of-bounds write in the MMQ scatter-quantize path for duplicate ids, and a
   multi-seq decode corruption from a Q8_1 quantize layout mismatch (flat vs. padded
-  per-row layout) that only surfaced at `n_seqs > 1` — both caught and fixed independently
+  per-row layout) that only surfaced at `n_seqs > 1` - both caught and fixed independently
   of the RDNA-boosts source.
 
 **Results** (5 trials each, same 7156-token real-code prompt used throughout this fork's
@@ -106,7 +111,70 @@ real gain on both: **decode 21.24 t/s avg vs 19.96 t/s baseline (+6.4%)**, **pre
 t/s avg vs 253.4 t/s baseline (+18.0%)**, with VRAM headroom unchanged or slightly better
 (QSA's sparse attention appears to use somewhat less KV working memory). Verified
 end-to-end at real production settings (temp 1.0, `--reasoning on`, `--jinja`, full
-`ngram-mod,draft-mtp` chain) — coherent output, correct usage accounting, no crash.
+`ngram-mod,draft-mtp` chain) - coherent output, correct usage accounting, no crash.
+
+## Speculative Prefill
+
+A hand-merged port of upstream's not-yet-merged
+[PR #27692](https://github.com/ggml-org/llama.cpp/pull/27692), "Speculative Prefill:
+Turbocharging TTFT with Lightweight and Training-Free Token Importance Estimation"
+([arXiv:2502.02789](https://arxiv.org/abs/2502.02789)). A small draft model prefills the
+prompt and decodes a few lookahead tokens; the softmax attention of those tokens over the
+prompt is captured via a ggml eval callback, smoothed, max-reduced over heads and layers,
+and pooled into chunks. Only the top-scoring chunks are fed to the target model - this is
+**lossy**, dropped chunks are gone for good.
+
+Because PR #27692 isn't merged upstream yet, this was hand-merged rather than
+cherry-picked: 11 of the PR's 13 changed files applied cleanly, and
+`tools/server/server-context.cpp` (~15 hunks - the `prompt_src()`/`n_prompt_src()`
+indirection, the new `ctx_spf`/`smpl_spf` server state, `apply_spec_prefill()`, the draft
+model loading block, the vocab-compat guard) was adapted by hand to coexist with this
+fork's existing `ngram-mod`/MTP/MoE-cache code rather than replace it. Prefill trimming is
+an independent knob here, not a replacement for decode speculation - you can run both at
+once.
+
+```
+--spec-prefill                          # enable
+--spec-prefill-draft-model FNAME, -mpd  # the estimator model (see below)
+--spec-prefill-p N                      # fraction of prompt chunks to KEEP (0.30 = drop 70%)
+--spec-prefill-draft-ngl N              # GPU layers for the estimator
+--spec-prefill-draft-device DEV         # which GPU runs the estimator
+--spec-prefill-draft-ctx N              # context for the estimator (see tuning note below)
+```
+
+**The estimator must share the target's exact vocab** - same tokenizer, not just the same
+size. MTP, DFlash2, DSpark and Eagle3 heads are target-dependent and this port's own
+compat guard correctly refuses to reuse them for this. For Qwen3.8-Flash-Next's
+non-standard 248,320-token `qwen4exp` vocab, no small sibling model was published - but
+[`empero-ai/Qwen3.8-4B-Distill-GGUF`](https://huggingface.co/empero-ai/Qwen3.8-4B-Distill-GGUF)
+(base: Qwen3.5-4B) turned out to match exactly: same hidden size (2560), same context
+length (262144), and a byte-for-byte identical token list across all 248,320 entries
+(diffed via `gguf-dump`, not just size-checked). No training or embedding surgery needed -
+it just works as the estimator.
+
+**Two tuning issues found during validation, both fixed here:**
+- `--spec-prefill-draft-ctx` defaults to matching the *main* context. At this fork's
+  production `--ctx-size 262144` that tries to allocate a 10GB+ compute buffer for an
+  8-token lookahead on a 4B model - pure waste. Capped at 4096 in the example config below;
+  raise it if your prompts regularly exceed that.
+- `--n-cpu-moe` needed bumping from 40 to 42 (2 more MoE layers offloaded to host RAM) to
+  free ~1.3GB VRAM so the estimator coexists with the MoE expert cache at full context.
+
+**Correctness**, verified via needle-in-a-haystack (a fact planted mid-prompt, retrieved
+after chunk trimming) at `--spec-prefill-p 0.30` (70% of prompt chunks dropped): retrieved
+correctly at both `--ctx-size 32768` and this fork's production `--ctx-size 262144`.
+Reproduce with `scripts/eval_spec_prefill_*.py` and `scripts/compare_spec_prefill.py` -
+this fork's own validation harness, included since the upstream PR's eval scripts and
+`llama-bench` changes were not ported. `scripts/run_paper_benchmarks.py` reproduces
+numbers in the shape of the original paper's own benchmark suite.
+
+**Speed**, measured on this box (dual gfx1201, Qwen3.8-Flash-Next target,
+`empero-ai/Qwen3.8-4B-Distill-GGUF` estimator), not just cited from the paper or the PR:
+
+| Context | Prefill (off -> on) | TTFT (4029-token prompt) |
+| --- | --- | --- |
+| 32768 | 304.65 -> 495.93 t/s (**+63%**) | 13.2s -> 8.1s |
+| 262144 (production) | -> 506.76 t/s | needle still retrieved correctly |
 
 ## Experimental: per-batch expert-count override
 
@@ -123,7 +191,7 @@ observed router confidence:
 --n-expert-used-adaptive           # derive the prefill value from live router confidence
                                     # instead of a fixed number
 --n-expert-used-adaptive-log       # log what --n-expert-used-adaptive would pick, without
-                                    # applying it — use this to calibrate first
+                                    # applying it - use this to calibrate first
 --n-expert-used-adaptive-layer N, --n-expert-used-adaptive-k-min N,
 --n-expert-used-adaptive-conf-low F, --n-expert-used-adaptive-conf-high F
                                     # tuning knobs for the adaptive heuristic above
@@ -131,21 +199,21 @@ observed router confidence:
 
 The model was not trained at a reduced `n_expert_used`, so any of these can change output
 quality, not just speed. Status: `--n-expert-used-decode 4` has one single-trial data point
-on the RDNA-boosts build (27.5 t/s vs. ~21.2 t/s at the default K=10 — a promising direction,
+on the RDNA-boosts build (27.5 t/s vs. ~21.2 t/s at the default K=10 - a promising direction,
 not a confirmed average) and only spot-checked coherence, no systematic quality diff against
 default output. The adaptive variant is un-benchmarked. Treat all of this as
-try-and-compare, not a drop-in default — all disabled (0 / off) unless set.
+try-and-compare, not a drop-in default - all disabled (0 / off) unless set.
 
 ## Correctness
 
 The cache and MTP integration were verified via greedy (temp=0) decoding on low-entropy
-prompts (e.g. "list the first 20 prime numbers") — far more sensitive to a data bug than
-stochastic sampling or open-ended creative/technical prompts — against the plain
+prompts (e.g. "list the first 20 prime numbers") - far more sensitive to a data bug than
+stochastic sampling or open-ended creative/technical prompts - against the plain
 `--n-cpu-moe` (no cache) build: **bit-identical** output, standalone and with MTP.
 
 If you're validating this on your own box: run the same prompt at `temp=0` (greedy) with the
 cache on and off and diff the output byte-for-byte. Greedy decoding surfaces a caching bug
-immediately — any wrong expert weight changes the argmax token somewhere in the sequence,
+immediately - any wrong expert weight changes the argmax token somewhere in the sequence,
 whereas stochastic sampling can mask a bug behind sampling noise for a long time before it's
 visible. The RDNA-boosts port was checked the same way (see Results above) plus a
 kernel-trace diff against the pre-port baseline to catch a fusion arm silently routing work
@@ -173,34 +241,34 @@ larger `--ctx-size 262144` config and isn't directly comparable to these two row
 The cache alone is good for **+24% decode / +23% prefill** here, consistent with the +23%
 decode figure quoted elsewhere in this fork's tuning notes for the same isolated
 no-cache/no-MTP comparison. The third row is a separate, larger-scale measurement with MTP
-and RDNA-boosts also enabled — its own +6.4% decode / +18.0% prefill delta (see RDNA-boosts
+and RDNA-boosts also enabled - its own +6.4% decode / +18.0% prefill delta (see RDNA-boosts
 port) is against a cache+MTP baseline, not against row 1 or 2 above. A few other things
 measured along the way, all reflected in the flags below:
 
-- `HSA_ENABLE_SDMA=1` (not `=0`) — re-enables ROCm's dedicated copy engines for cross-device
+- `HSA_ENABLE_SDMA=1` (not `=0`) - re-enables ROCm's dedicated copy engines for cross-device
   traffic. Measured **+8.9%** on this dual-GPU box; the *opposite* direction on a single-GPU
   box (no cross-device traffic to unblock), so don't carry this over blindly.
-- `--spec-type ngram-mod,draft-mtp` instead of just `draft-mtp` — a priority-ordered chain
+- `--spec-type ngram-mod,draft-mtp` instead of just `draft-mtp` - a priority-ordered chain
   (cheap exact n-gram matches get first shot each step, falling back to MTP's learned draft).
   +2.5% measured on novel/non-repetitive content, much larger on repetitive or templated
   content, no measured downside.
 - GPU performance level: leave it at **`auto`**, don't lock it to `high`. Counterintuitive,
-  but measured **~10% slower** locked to `high` in a repeated A/B on this workload — this
+  but measured **~10% slower** locked to `high` in a repeated A/B on this workload - this
   offload-heavy decode pattern has enough idle gaps between GPU bursts that a locked-high
   clock loses to the driver's own dynamic boosting.
 - `--threads`: more isn't better past your physical core count. On this 6-core/12-thread
   CPU, 6 threads beat 4, 8, and 10; **12 threads (the full logical count) hung the server
   outright** rather than just running slower. Don't default to `nproc`.
 - `--moe-expert-cache-experts 96` / `--n-cpu-moe 40` / `--moe-expert-cache-inserts 4` are
-  this box's measured sweep optimum, not defaults to copy blindly — re-tune for your own
+  this box's measured sweep optimum, not defaults to copy blindly - re-tune for your own
   VRAM budget and GPU count.
 - **Prefill**: every `--n-cpu-moe`-offloaded expert weight tensor gets host-memory pinned
-  (page-locked in place, no copy) at load time, not just the ones the cache tracks —
+  (page-locked in place, no copy) at load time, not just the ones the cache tracks -
   `ggml-backend-sched`'s own op-offload path streams these same weights to a GPU for large
   batches (prefill) regardless of whether the cache is enabled, and that copy is much faster
   from pinned memory (direct async DMA) than from plain mmap'd memory (routed through the
   driver's bounce buffer at roughly half bandwidth). Measured **+41%** prefill throughput
-  (253 → 357 tok/s pooled, 35 offloaded layers, ~3600-token prompt) for a fixed one-time load
+  (253 -> 357 tok/s pooled, 35 offloaded layers, ~3600-token prompt) for a fixed one-time load
   cost of **+3.9s** (pinning ~53GB of host memory). This applies with the cache on or off.
 
 Actual speedup depends heavily on model, quant, hardware, and `--n-cpu-moe`/context-size
@@ -208,7 +276,7 @@ tuning. The numbers above are one box's measurements, not a general guarantee.
 
 ## Building
 
-Standard llama.cpp build process — see [docs/build.md](docs/build.md) for the full matrix.
+Standard llama.cpp build process - see [docs/build.md](docs/build.md) for the full matrix.
 ROCm/HIP example (used for the numbers above):
 
 ```bash
@@ -219,8 +287,8 @@ cmake --build build --config Release -j "$(nproc)"
 ```
 
 Swap `-DAMDGPU_TARGETS=gfx1201` for your GPU's target. CUDA builds should work the same way
-with `-DGGML_CUDA=ON` in place of `-DGGML_HIP=ON` — the cache's tensor-set/synchronize calls
-go through the standard `ggml-backend` async API, nothing HIP-specific — but this hasn't
+with `-DGGML_CUDA=ON` in place of `-DGGML_HIP=ON` - the cache's tensor-set/synchronize calls
+go through the standard `ggml-backend` async API, nothing HIP-specific - but this hasn't
 been tested on real NVIDIA hardware. Same build steps produce the RDNA-boosts binary; there
 is no separate build flag, the boosts are compiled in.
 
@@ -240,11 +308,22 @@ is no separate build flag, the boosts are compiled in.
 `HSA_ENABLE_SDMA=1` should already be your ROCm default; only worth setting explicitly if
 something else in your environment disables it. Add `--n-expert-used-decode N` (or the other
 `--n-expert-used-*` flags above) only if you've read the Experimental section and want to
-try-and-compare — they're off by default.
+try-and-compare - they're off by default.
+
+Add Speculative Prefill to the above (requires the estimator model - see that section):
+
+```bash
+  --spec-prefill --spec-prefill-draft-model Qwen3.8-4B-Q4_K_M.gguf \
+  --spec-prefill-p 0.30 --spec-prefill-draft-ngl 999 --spec-prefill-draft-device ROCm0 \
+  --spec-prefill-draft-ctx 4096
+```
+
+Note `--n-cpu-moe 42` instead of `40` when running with Speculative Prefill enabled, per
+the tuning note above.
 
 ## License
 
-MIT, same as upstream llama.cpp — see [LICENSE](LICENSE).
+MIT, same as upstream llama.cpp - see [LICENSE](LICENSE).
 
 ---
 
