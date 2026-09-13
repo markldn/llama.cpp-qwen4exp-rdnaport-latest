@@ -152,6 +152,18 @@ length (262144), and a byte-for-byte identical token list across all 248,320 ent
 (diffed via `gguf-dump`, not just size-checked). No training or embedding surgery needed -
 it just works as the estimator.
 
+Download the quant used for the numbers below (2.78GB):
+
+```bash
+huggingface-cli download empero-ai/Qwen3.8-4B-Distill-GGUF Qwen3.8-4B-Q4_K_M.gguf \
+  --local-dir ./models/empero-ai/Qwen3.8-4B-Distill-GGUF
+```
+
+If you swap in a different target model or a different estimator, re-verify the vocab match
+yourself before trusting the output - a coincidental vocab-size match without an actual
+tokenizer diff would pass this port's runtime check (size-only, +-128 tokens) and silently
+produce garbage. Don't skip that step.
+
 **Two tuning issues found during validation, both fixed here:**
 - `--spec-prefill-draft-ctx` defaults to matching the *main* context. At this fork's
   production `--ctx-size 262144` that tries to allocate a 10GB+ compute buffer for an
