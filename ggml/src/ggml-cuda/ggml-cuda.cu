@@ -3662,17 +3662,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    if (node->op == GGML_OP_MUL) {
-        ggml_cuda_moe_weighted_reduction_match match;
-        if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
-            const int output_idx = i + match.node_count - 1;
-            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
-                ggml_cuda_op_moe_weighted_reduction(
-                    *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
-                return match.node_count - 1;
-            }
-        }
-    }
+    // NOTE: upstream's GGML_OP_MUL -> MoE weighted-reduction fusion (matching
+    // ggml_cuda_match_moe_weighted_reduction / ggml_cuda_op_moe_weighted_reduction) was
+    // evaluated here during the upstream merge and deliberately left out: enabling it
+    // measured a ~46% prefill regression on this fork's qwen4exp config (265 vs 502 t/s
+    // pp2048 with GGML_CUDA_DISABLE_FUSION=1 as an A/B), almost certainly misfiring
+    // against qwen4exp's unusual graph shape (hc_mix/hc_combine/QSA) rather than the
+    // standard MoE graphs it was designed for. The matcher/op functions are still defined
+    // and still used by ggml_backend_cuda_graph_optimize()'s allocation-dependency tracking
+    // below, which is unrelated and untouched - only the fusion dispatch here was removed.
 
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
