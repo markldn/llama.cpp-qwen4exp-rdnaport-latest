@@ -1486,11 +1486,11 @@ static uint32_t llm_graph_moe_n_expert_used(const llm_graph_params & params) {
 
     if (!params.ubatch.is_real_prefill()) {
         return cparams.n_expert_used_decode > 0 ?
-            (uint32_t) cparams.n_expert_used_decode : hparams.n_expert_used;
+            (uint32_t) cparams.n_expert_used_decode : hparams.n_expert_used();
     }
 
     const uint32_t k_static = cparams.n_expert_used_prefill > 0 ?
-        (uint32_t) cparams.n_expert_used_prefill : hparams.n_expert_used;
+        (uint32_t) cparams.n_expert_used_prefill : hparams.n_expert_used();
 
     if (cparams.moe_dynamic_k && cparams.n_expert_used_adaptive) {
         return cparams.moe_dynamic_k->suggest_k(k_static);

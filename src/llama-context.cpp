@@ -118,7 +118,7 @@ llama_context::llama_context(
     if (params.n_expert_used_adaptive || params.n_expert_used_adaptive_log) {
         moe_dyn_k = std::make_unique<llama_moe_dynamic_k>(
             hparams.n_layer(),
-            hparams.n_expert_used,
+            hparams.n_expert_used(),
             params.n_expert_used_adaptive_layer,
             std::max(1, params.n_expert_used_adaptive_k_min),
             params.n_expert_used_adaptive_conf_low,

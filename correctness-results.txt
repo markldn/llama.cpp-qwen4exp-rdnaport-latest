@@ -1,0 +1,78 @@
+--- PLAIN CONFIG (no spec-decode, no cache, no spec-prefill) ---
+=== starting ref-plain (/home/mark/scripts/llama.cpp-qwen4exp-rdnaport-specprefill/build-stage2/bin/llama-server) ===
+ref-plain plain output saved (339 chars)
+ref-plain needle output: 
+
+<think>
+
+</think>
+
+The secret passcode mentioned at the start of the text is **ZQX-7734-MOON**.
+=== starting new-plain (/home/mark/scripts/llama.cpp-qwen4exp-rdnaport-latest/build-stage2/bin/llama-server) ===
+new-plain plain output saved (339 chars)
+new-plain needle output: 
+
+<think>
+
+</think>
+
+The secret passcode mentioned at the start of the text is **ZQX-7734-MOON**.
+--- FULL-STACK CONFIG (MTP + MoE cache + Speculative Prefill) ---
+=== starting ref-full (/home/mark/scripts/llama.cpp-qwen4exp-rdnaport-specprefill/build-stage2/bin/llama-server) ===
+ref-full plain output saved (339 chars)
+ref-full needle output: 
+
+<think>
+The user is asking me to recall the secret passcode mentioned at the start of the text. Let me look at the beginning of the text.
+
+The text starts with: "The secret passcode is ZQX-7734-MOON."
+
+Then it repeats
+=== starting new-full (/home/mark/scripts/llama.cpp-qwen4exp-rdnaport-latest/build-stage2/bin/llama-server) ===
+new-full plain output saved (339 chars)
+new-full needle output: 
+
+<think>
+The user is asking me to recall the secret passcode mentioned at the start of the text. Let me look at the beginning of the text.
+
+The text starts with: "The secret passcode is ZQX-7734-MOON."
+
+Then it repeats
+=== DIFFS ===
+--- plain (plain-prompt) diff ---
+IDENTICAL
+--- plain (needle) content ---
+ref:  
+
+<think>
+
+</think>
+
+The secret passcode mentioned at the start of the text is **ZQX-7734-MOON**.
+new:  
+
+<think>
+
+</think>
+
+The secret passcode mentioned at the start of the text is **ZQX-7734-MOON**.
+--- full (plain-prompt) diff ---
+IDENTICAL
+--- full (needle) content ---
+ref:  
+
+<think>
+The user is asking me to recall the secret passcode mentioned at the start of the text. Let me look at the beginning of the text.
+
+The text starts with: "The secret passcode is ZQX-7734-MOON."
+
+Then it repeats
+new:  
+
+<think>
+The user is asking me to recall the secret passcode mentioned at the start of the text. Let me look at the beginning of the text.
+
+The text starts with: "The secret passcode is ZQX-7734-MOON."
+
+Then it repeats
+CORRECTNESS_VALIDATION_DONE
