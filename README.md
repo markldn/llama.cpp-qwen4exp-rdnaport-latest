@@ -20,8 +20,33 @@ upstream's `qwen4exp` code (checked directly against `origin/master` as of this 
 Loading a `qwen4exp` NextN/MTP draft checkpoint via `-md` needed genuinely new conversion
 and graph-building code, which is this fork's actual contribution here - see below.
 
-Base: upstream commit `88ddbf0a1` (the commit that merged `qwen4exp` architecture support,
-[PR #27742](https://github.com/ggml-org/llama.cpp/pull/27742)).
+Base: upstream commit `4a8993735` (`master` as of 2026-09-13) - this fork previously sat on
+`88ddbf0a1` (2026-08-30, the commit that merged `qwen4exp` architecture support,
+[PR #27742](https://github.com/ggml-org/llama.cpp/pull/27742)), a 281-commit/2-week gap
+that was closed via `git merge` (not rebase - more tractable to resolve as one merge commit
+than replaying ~30+ fork-specific commits individually against a moved base).
+
+The merge itself needed 32 conflict hunks resolved across 12 files (mainly the RDNA4 kernel
+tuning tables, the `qwen4exp` NextN/MTP draft-head wiring, the MoE expert cache, and an
+upstream `hparams` field->method API change). Two real bugs only surfaced after that, at
+build/validation time, not as conflict markers:
+- A flash-attention kernel dispatch bug (`fattn-tile.cuh`) that crashed the server on every
+  startup - the merge resolution had hardcoded `true,true` for two K/V-type-dependent flags
+  instead of the real computed values, plus a separate short-by-one-argument call site.
+- Upstream's new MoE weighted-reduction kernel fusion misfiring against this model's
+  non-standard graph shape (the `hc_mix`/`hc_combine`/QSA pieces), costing a measured 46%
+  prefill regression - confirmed via `GGML_CUDA_DISABLE_FUSION=1` A/B, fixed by not
+  registering that one fusion for this build (the matcher itself is upstream's, unmodified).
+
+Post-fix: raw kernels back to pre-merge parity, full-stack prefill **+9%** (541.57 vs
+495.93 t/s at matched settings, see Benchmarks), MTP draft acceptance 90%. Needle-in-haystack
+correctness holds on plain decode and the full MTP + MoE-cache + Speculative-Prefill stack
+together. One methodology note: exact byte-diffing greedy output against a reference build
+turned out not to be a reliable correctness oracle for this model on its own - its
+CPU-offloaded MoE reduction has genuine run-to-run floating-point non-determinism (same
+binary, same config, different process starts can diverge slightly; each run is internally
+deterministic, just not bit-identical across restarts) - so correctness here is judged by
+coherent/correct output and needle-in-haystack retrieval, not byte-for-byte diffing.
 
 This repo is published as a squashed snapshot (one commit, no incremental history) rather
 than the full commit-by-commit history against that base - `git log` here won't show
@@ -199,8 +224,12 @@ numbers in the shape of the original paper's own benchmark suite.
 
 | Context | Prefill (off -> on) | TTFT (4029-token prompt) |
 | --- | --- | --- |
-| 32768 | 304.65 -> 495.93 t/s (**+63%**) | 13.2s -> 8.1s |
+| 32768 (pre-upstream-merge) | 304.65 -> 495.93 t/s (**+63%**) | 13.2s -> 8.1s |
+| 32768 (post-upstream-merge) | -> 541.57 t/s (**+9%** over the 495.93 above) | - |
 | 262144 (production) | -> 506.76 t/s | needle still retrieved correctly |
+
+The post-merge number is the one to trust going forward - see the base-commit note above
+for what closing the upstream gap changed and the two bugs it took to get there.
 
 ## Experimental: per-batch expert-count override
 
